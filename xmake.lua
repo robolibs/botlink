@@ -10,8 +10,11 @@ local PROJECT_VERSION = "0.0.1"
 --   System: "pkgconfig::libname" or {system = "boost"}
 local LIB_DEPS = {
     {"echo", "https://github.com/bresilla/echo.git", "0.0.23"},
-    {"datapod", "https://github.com/robolibs/datapod.git", "0.0.34"},
-    {"netpipe", "https://github.com/robolibs/wirebit.git", "0.0.10"},
+    {"datapod", "https://github.com/robolibs/datapod.git", "0.0.36"},
+    {"wirebit", "https://github.com/robolibs/wirebit.git", "0.0.10"},
+    {"keylock", "https://github.com/robolibs/keylock.git", "0.0.4"},
+    {"blockit", "https://github.com/robolibs/blockit.git", "0.0.6"},
+    {system = "libsodium"},
 }
 local EXAMPLE_DEPS = {
     {system = "rerun_sdk"},
