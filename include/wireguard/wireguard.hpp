@@ -1,16 +1,26 @@
 /* SPDX-License-Identifier: LGPL-2.1+ */
 /*
+ * Modern C++ WireGuard Management Library
+ *
+ * Original C implementation:
  * Copyright (C) 2015-2020 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  * Copyright (C) 2008-2012 Pablo Neira Ayuso <pablo@netfilter.org>.
+ *
+ * C++ conversion using datapod library.
  */
 
 #ifndef WIREGUARD_HPP
 #define WIREGUARD_HPP
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 
-#include <assert.h>
-#include <errno.h>
+#include <datapod/datapod.hpp>
+#include <keylock/keylock.hpp>
+
+#include <cstring>
+#include <ctime>
 #include <fcntl.h>
 #include <linux/genetlink.h>
 #include <linux/if_link.h>
@@ -18,1720 +28,1434 @@
 #include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <netinet/in.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
-#include <time.h>
 #include <unistd.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+namespace wg {
 
-typedef uint8_t wg_key[32];
-typedef char wg_key_b64_string[((sizeof(wg_key) + 2) / 3) * 4 + 1];
+    using namespace dp;
 
-/* Cross platform __kernel_timespec */
-struct timespec64 {
-    int64_t tv_sec;
-    int64_t tv_nsec;
-};
+    // =============================================================================
+    // Constants
+    // =============================================================================
 
-typedef struct wg_allowedip {
-    uint16_t family;
-    union {
-        struct in_addr ip4;
-        struct in6_addr ip6;
+    inline constexpr usize KEY_SIZE = 32;
+    inline constexpr usize KEY_B64_SIZE = ((KEY_SIZE + 2) / 3) * 4 + 1;
+    inline constexpr const char *GENL_NAME = "wireguard";
+    inline constexpr u8 GENL_VERSION = 1;
+
+    // =============================================================================
+    // Forward Declarations
+    // =============================================================================
+
+    class AllowedIp;
+    class Peer;
+    class Device;
+    class NetlinkSocket;
+    class GenetlinkSocket;
+
+    // =============================================================================
+    // Key Types
+    // =============================================================================
+
+    struct Key {
+        Array<u8, KEY_SIZE> data{};
+
+        Key() = default;
+
+        explicit Key(const u8 *src) {
+            if (src) {
+                std::memcpy(data.data(), src, KEY_SIZE);
+            }
+        }
+
+        [[nodiscard]] auto is_zero() const -> bool {
+            volatile u8 acc = 0;
+            for (usize i = 0; i < KEY_SIZE; ++i) {
+                acc |= data[i];
+                __asm__("" : "=r"(acc) : "0"(acc));
+            }
+            return static_cast<bool>(1 & ((acc - 1) >> 8));
+        }
+
+        [[nodiscard]] auto operator==(const Key &other) const -> bool {
+            return std::memcmp(data.data(), other.data.data(), KEY_SIZE) == 0;
+        }
+
+        [[nodiscard]] auto operator!=(const Key &other) const -> bool { return !(*this == other); }
+
+        [[nodiscard]] auto raw() -> u8 * { return data.data(); }
+        [[nodiscard]] auto raw() const -> const u8 * { return data.data(); }
     };
-    uint8_t cidr;
-    struct wg_allowedip *next_allowedip;
-} wg_allowedip;
 
-enum wg_peer_flags {
-    WGPEER_REMOVE_ME = 1U << 0,
-    WGPEER_REPLACE_ALLOWEDIPS = 1U << 1,
-    WGPEER_HAS_PUBLIC_KEY = 1U << 2,
-    WGPEER_HAS_PRESHARED_KEY = 1U << 3,
-    WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL = 1U << 4
-};
+    struct KeyB64 {
+        Array<char, KEY_B64_SIZE> data{};
 
-typedef union wg_endpoint {
-    struct sockaddr addr;
-    struct sockaddr_in addr4;
-    struct sockaddr_in6 addr6;
-} wg_endpoint;
+        KeyB64() = default;
 
-typedef struct wg_peer {
-    enum wg_peer_flags flags;
-
-    wg_key public_key;
-    wg_key preshared_key;
-
-    wg_endpoint endpoint;
-
-    struct timespec64 last_handshake_time;
-    uint64_t rx_bytes, tx_bytes;
-    uint16_t persistent_keepalive_interval;
-
-    struct wg_allowedip *first_allowedip, *last_allowedip;
-    struct wg_peer *next_peer;
-} wg_peer;
-
-enum wg_device_flags {
-    WGDEVICE_REPLACE_PEERS = 1U << 0,
-    WGDEVICE_HAS_PRIVATE_KEY = 1U << 1,
-    WGDEVICE_HAS_PUBLIC_KEY = 1U << 2,
-    WGDEVICE_HAS_LISTEN_PORT = 1U << 3,
-    WGDEVICE_HAS_FWMARK = 1U << 4
-};
-
-typedef struct wg_device {
-    char name[IFNAMSIZ];
-    uint32_t ifindex;
-
-    enum wg_device_flags flags;
-
-    wg_key public_key;
-    wg_key private_key;
-
-    uint32_t fwmark;
-    uint16_t listen_port;
-
-    struct wg_peer *first_peer, *last_peer;
-} wg_device;
-
-#define wg_for_each_device_name(__names, __name, __len)                                                                \
-    for ((__name) = (__names), (__len) = 0; ((__len) = strlen(__name)); (__name) += (__len) + 1)
-#define wg_for_each_peer(__dev, __peer) for ((__peer) = (__dev)->first_peer; (__peer); (__peer) = (__peer)->next_peer)
-#define wg_for_each_allowedip(__peer, __allowedip)                                                                     \
-    for ((__allowedip) = (__peer)->first_allowedip; (__allowedip); (__allowedip) = (__allowedip)->next_allowedip)
-
-/* Public API forward declarations */
-inline int wg_set_device(wg_device *dev);
-inline int wg_get_device(wg_device **dev, const char *device_name);
-inline int wg_add_device(const char *device_name);
-inline int wg_del_device(const char *device_name);
-inline void wg_free_device(wg_device *dev);
-inline char *wg_list_device_names(void);
-inline void wg_key_to_base64(wg_key_b64_string base64, const wg_key key);
-inline int wg_key_from_base64(wg_key key, const wg_key_b64_string base64);
-inline bool wg_key_is_zero(const wg_key key);
-inline void wg_generate_public_key(wg_key public_key, const wg_key private_key);
-inline void wg_generate_private_key(wg_key private_key);
-inline void wg_generate_preshared_key(wg_key preshared_key);
-
-/* wireguard.h netlink uapi: */
-
-#define WG_GENL_NAME "wireguard"
-#define WG_GENL_VERSION 1
-
-enum wg_cmd { WG_CMD_GET_DEVICE, WG_CMD_SET_DEVICE, __WG_CMD_MAX };
-
-enum wgdevice_flag { WGDEVICE_F_REPLACE_PEERS = 1U << 0 };
-enum wgdevice_attribute {
-    WGDEVICE_A_UNSPEC,
-    WGDEVICE_A_IFINDEX,
-    WGDEVICE_A_IFNAME,
-    WGDEVICE_A_PRIVATE_KEY,
-    WGDEVICE_A_PUBLIC_KEY,
-    WGDEVICE_A_FLAGS,
-    WGDEVICE_A_LISTEN_PORT,
-    WGDEVICE_A_FWMARK,
-    WGDEVICE_A_PEERS,
-    __WGDEVICE_A_LAST
-};
-
-enum wgpeer_flag { WGPEER_F_REMOVE_ME = 1U << 0, WGPEER_F_REPLACE_ALLOWEDIPS = 1U << 1 };
-enum wgpeer_attribute {
-    WGPEER_A_UNSPEC,
-    WGPEER_A_PUBLIC_KEY,
-    WGPEER_A_PRESHARED_KEY,
-    WGPEER_A_FLAGS,
-    WGPEER_A_ENDPOINT,
-    WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL,
-    WGPEER_A_LAST_HANDSHAKE_TIME,
-    WGPEER_A_RX_BYTES,
-    WGPEER_A_TX_BYTES,
-    WGPEER_A_ALLOWEDIPS,
-    WGPEER_A_PROTOCOL_VERSION,
-    __WGPEER_A_LAST
-};
-
-enum wgallowedip_attribute {
-    WGALLOWEDIP_A_UNSPEC,
-    WGALLOWEDIP_A_FAMILY,
-    WGALLOWEDIP_A_IPADDR,
-    WGALLOWEDIP_A_CIDR_MASK,
-    __WGALLOWEDIP_A_LAST
-};
-
-/* libmnl mini library: */
-
-#define MNL_SOCKET_AUTOPID 0
-#define MNL_ALIGNTO 4
-#define MNL_ALIGN(len) (((len) + MNL_ALIGNTO - 1) & ~(MNL_ALIGNTO - 1))
-#define MNL_NLMSG_HDRLEN MNL_ALIGN(sizeof(struct nlmsghdr))
-#define MNL_ATTR_HDRLEN MNL_ALIGN(sizeof(struct nlattr))
-
-enum mnl_attr_data_type {
-    MNL_TYPE_UNSPEC,
-    MNL_TYPE_U8,
-    MNL_TYPE_U16,
-    MNL_TYPE_U32,
-    MNL_TYPE_U64,
-    MNL_TYPE_STRING,
-    MNL_TYPE_FLAG,
-    MNL_TYPE_MSECS,
-    MNL_TYPE_NESTED,
-    MNL_TYPE_NESTED_COMPAT,
-    MNL_TYPE_NUL_STRING,
-    MNL_TYPE_BINARY,
-    MNL_TYPE_MAX,
-};
-
-#define mnl_attr_for_each(attr, nlh, offset)                                                                           \
-    for ((attr) = (struct nlattr *)mnl_nlmsg_get_payload_offset((nlh), (offset));                                      \
-         mnl_attr_ok((attr), (char *)mnl_nlmsg_get_payload_tail(nlh) - (char *)(attr)); (attr) = mnl_attr_next(attr))
-
-#define mnl_attr_for_each_nested(attr, nest)                                                                           \
-    for ((attr) = (struct nlattr *)mnl_attr_get_payload(nest);                                                         \
-         mnl_attr_ok((attr), (char *)mnl_attr_get_payload(nest) + mnl_attr_get_payload_len(nest) - (char *)(attr));    \
-         (attr) = mnl_attr_next(attr))
-
-#define mnl_attr_for_each_payload(payload, payload_size)                                                               \
-    for ((attr) = (struct nlattr *)(payload); mnl_attr_ok((attr), (char *)(payload) + payload_size - (char *)(attr));  \
-         (attr) = mnl_attr_next(attr))
-
-#define MNL_CB_ERROR -1
-#define MNL_CB_STOP 0
-#define MNL_CB_OK 1
-
-typedef int (*mnl_attr_cb_t)(const struct nlattr *attr, void *data);
-typedef int (*mnl_cb_t)(const struct nlmsghdr *nlh, void *data);
-
-#ifndef MNL_ARRAY_SIZE
-#define MNL_ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
-#endif
-
-static inline size_t mnl_ideal_socket_buffer_size(void) {
-    static size_t size = 0;
-
-    if (size)
-        return size;
-    size = (size_t)sysconf(_SC_PAGESIZE);
-    if (size > 8192)
-        size = 8192;
-    return size;
-}
-
-static inline size_t mnl_nlmsg_size(size_t len) { return len + MNL_NLMSG_HDRLEN; }
-
-static inline struct nlmsghdr *mnl_nlmsg_put_header(void *buf) {
-    int len = MNL_ALIGN(sizeof(struct nlmsghdr));
-    struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
-
-    memset(buf, 0, len);
-    nlh->nlmsg_len = len;
-    return nlh;
-}
-
-static inline void *mnl_nlmsg_put_extra_header(struct nlmsghdr *nlh, size_t size) {
-    char *ptr = (char *)nlh + nlh->nlmsg_len;
-    size_t len = MNL_ALIGN(size);
-    nlh->nlmsg_len += len;
-    memset(ptr, 0, len);
-    return ptr;
-}
-
-static inline void *mnl_nlmsg_get_payload(const struct nlmsghdr *nlh) {
-    return (void *)((char *)nlh + MNL_NLMSG_HDRLEN);
-}
-static inline void *mnl_nlmsg_get_payload_offset(const struct nlmsghdr *nlh, size_t offset) {
-    return (void *)(((char *)nlh) + MNL_NLMSG_HDRLEN + MNL_ALIGN(offset));
-}
-
-static inline bool mnl_nlmsg_ok(const struct nlmsghdr *nlh, int len) {
-    return len >= (int)sizeof(struct nlmsghdr) && nlh->nlmsg_len >= sizeof(struct nlmsghdr) &&
-           (int)nlh->nlmsg_len <= len;
-}
-
-static inline struct nlmsghdr *mnl_nlmsg_next(const struct nlmsghdr *nlh, int *len) {
-    *len -= MNL_ALIGN(nlh->nlmsg_len);
-    return (struct nlmsghdr *)(((char *)nlh) + MNL_ALIGN(nlh->nlmsg_len));
-}
-
-static inline void *mnl_nlmsg_get_payload_tail(const struct nlmsghdr *nlh) {
-    return (void *)((char *)nlh + MNL_ALIGN(nlh->nlmsg_len));
-}
-
-static inline bool mnl_nlmsg_seq_ok(const struct nlmsghdr *nlh, unsigned int seq) {
-    return nlh->nlmsg_seq && seq ? nlh->nlmsg_seq == seq : true;
-}
-
-static inline bool mnl_nlmsg_portid_ok(const struct nlmsghdr *nlh, unsigned int portid) {
-    return nlh->nlmsg_pid && portid ? nlh->nlmsg_pid == portid : true;
-}
-
-static inline uint16_t mnl_attr_get_type(const struct nlattr *attr) { return attr->nla_type & NLA_TYPE_MASK; }
-
-static inline uint16_t mnl_attr_get_payload_len(const struct nlattr *attr) { return attr->nla_len - MNL_ATTR_HDRLEN; }
-
-static inline void *mnl_attr_get_payload(const struct nlattr *attr) { return (void *)((char *)attr + MNL_ATTR_HDRLEN); }
-
-static inline bool mnl_attr_ok(const struct nlattr *attr, int len) {
-    return len >= (int)sizeof(struct nlattr) && attr->nla_len >= sizeof(struct nlattr) && (int)attr->nla_len <= len;
-}
-
-static inline struct nlattr *mnl_attr_next(const struct nlattr *attr) {
-    return (struct nlattr *)(((char *)attr) + MNL_ALIGN(attr->nla_len));
-}
-
-static inline int mnl_attr_type_valid(const struct nlattr *attr, uint16_t max) {
-    if (mnl_attr_get_type(attr) > max) {
-        errno = EOPNOTSUPP;
-        return -1;
-    }
-    return 1;
-}
-
-static inline int __mnl_attr_validate(const struct nlattr *attr, enum mnl_attr_data_type type, size_t exp_len) {
-    uint16_t attr_len = mnl_attr_get_payload_len(attr);
-    const char *attr_data = (const char *)mnl_attr_get_payload(attr);
-
-    if (attr_len < exp_len) {
-        errno = ERANGE;
-        return -1;
-    }
-    switch (type) {
-    case MNL_TYPE_FLAG:
-        if (attr_len > 0) {
-            errno = ERANGE;
-            return -1;
-        }
-        break;
-    case MNL_TYPE_NUL_STRING:
-        if (attr_len == 0) {
-            errno = ERANGE;
-            return -1;
-        }
-        if (attr_data[attr_len - 1] != '\0') {
-            errno = EINVAL;
-            return -1;
-        }
-        break;
-    case MNL_TYPE_STRING:
-        if (attr_len == 0) {
-            errno = ERANGE;
-            return -1;
-        }
-        break;
-    case MNL_TYPE_NESTED:
-
-        if (attr_len == 0)
-            break;
-
-        if (attr_len < MNL_ATTR_HDRLEN) {
-            errno = ERANGE;
-            return -1;
-        }
-        break;
-    default:
-
-        break;
-    }
-    if (exp_len && attr_len > exp_len) {
-        errno = ERANGE;
-        return -1;
-    }
-    return 0;
-}
-
-static const size_t mnl_attr_data_type_len[MNL_TYPE_MAX] = {
-    0,                // MNL_TYPE_UNSPEC
-    sizeof(uint8_t),  // MNL_TYPE_U8
-    sizeof(uint16_t), // MNL_TYPE_U16
-    sizeof(uint32_t), // MNL_TYPE_U32
-    sizeof(uint64_t), // MNL_TYPE_U64
-    0,                // MNL_TYPE_STRING
-    0,                // MNL_TYPE_FLAG
-    sizeof(uint64_t), // MNL_TYPE_MSECS
-    0,                // MNL_TYPE_NESTED
-    0,                // MNL_TYPE_NESTED_COMPAT
-    0,                // MNL_TYPE_NUL_STRING
-    0,                // MNL_TYPE_BINARY
-};
-
-static inline int mnl_attr_validate(const struct nlattr *attr, enum mnl_attr_data_type type) {
-    int exp_len;
-
-    if (type >= MNL_TYPE_MAX) {
-        errno = EINVAL;
-        return -1;
-    }
-    exp_len = mnl_attr_data_type_len[type];
-    return __mnl_attr_validate(attr, type, exp_len);
-}
-
-static inline int mnl_attr_parse(const struct nlmsghdr *nlh, unsigned int offset, mnl_attr_cb_t cb, void *data) {
-    int ret = MNL_CB_OK;
-    const struct nlattr *attr;
-
-    mnl_attr_for_each(attr, nlh, offset) if ((ret = cb(attr, data)) <= MNL_CB_STOP) return ret;
-    return ret;
-}
-
-static inline int mnl_attr_parse_nested(const struct nlattr *nested, mnl_attr_cb_t cb, void *data) {
-    int ret = MNL_CB_OK;
-    const struct nlattr *attr;
-
-    mnl_attr_for_each_nested(attr, nested) if ((ret = cb(attr, data)) <= MNL_CB_STOP) return ret;
-    return ret;
-}
-
-static inline uint8_t mnl_attr_get_u8(const struct nlattr *attr) { return *((uint8_t *)mnl_attr_get_payload(attr)); }
-
-static inline uint16_t mnl_attr_get_u16(const struct nlattr *attr) { return *((uint16_t *)mnl_attr_get_payload(attr)); }
-
-static inline uint32_t mnl_attr_get_u32(const struct nlattr *attr) { return *((uint32_t *)mnl_attr_get_payload(attr)); }
-
-static inline uint64_t mnl_attr_get_u64(const struct nlattr *attr) {
-    uint64_t tmp;
-    memcpy(&tmp, mnl_attr_get_payload(attr), sizeof(tmp));
-    return tmp;
-}
-
-static inline const char *mnl_attr_get_str(const struct nlattr *attr) {
-    return (const char *)mnl_attr_get_payload(attr);
-}
-
-static inline void mnl_attr_put(struct nlmsghdr *nlh, uint16_t type, size_t len, const void *data) {
-    struct nlattr *attr = (struct nlattr *)mnl_nlmsg_get_payload_tail(nlh);
-    uint16_t payload_len = MNL_ALIGN(sizeof(struct nlattr)) + len;
-    int pad;
-
-    attr->nla_type = type;
-    attr->nla_len = payload_len;
-    memcpy(mnl_attr_get_payload(attr), data, len);
-    nlh->nlmsg_len += MNL_ALIGN(payload_len);
-    pad = MNL_ALIGN(len) - len;
-    if (pad > 0)
-        memset((char *)mnl_attr_get_payload(attr) + len, 0, pad);
-}
-
-static inline void mnl_attr_put_u16(struct nlmsghdr *nlh, uint16_t type, uint16_t data) {
-    mnl_attr_put(nlh, type, sizeof(uint16_t), &data);
-}
-
-static inline void mnl_attr_put_u32(struct nlmsghdr *nlh, uint16_t type, uint32_t data) {
-    mnl_attr_put(nlh, type, sizeof(uint32_t), &data);
-}
-
-static inline void mnl_attr_put_strz(struct nlmsghdr *nlh, uint16_t type, const char *data) {
-    mnl_attr_put(nlh, type, strlen(data) + 1, data);
-}
-
-static inline struct nlattr *mnl_attr_nest_start(struct nlmsghdr *nlh, uint16_t type) {
-    struct nlattr *start = (struct nlattr *)mnl_nlmsg_get_payload_tail(nlh);
-
-    start->nla_type = NLA_F_NESTED | type;
-    nlh->nlmsg_len += MNL_ALIGN(sizeof(struct nlattr));
-    return start;
-}
-
-static inline bool mnl_attr_put_check(struct nlmsghdr *nlh, size_t buflen, uint16_t type, size_t len,
-                                      const void *data) {
-    if (nlh->nlmsg_len + MNL_ATTR_HDRLEN + MNL_ALIGN(len) > buflen)
-        return false;
-    mnl_attr_put(nlh, type, len, data);
-    return true;
-}
-
-static inline bool mnl_attr_put_u8_check(struct nlmsghdr *nlh, size_t buflen, uint16_t type, uint8_t data) {
-    return mnl_attr_put_check(nlh, buflen, type, sizeof(uint8_t), &data);
-}
-
-static inline bool mnl_attr_put_u16_check(struct nlmsghdr *nlh, size_t buflen, uint16_t type, uint16_t data) {
-    return mnl_attr_put_check(nlh, buflen, type, sizeof(uint16_t), &data);
-}
-
-static inline bool mnl_attr_put_u32_check(struct nlmsghdr *nlh, size_t buflen, uint16_t type, uint32_t data) {
-    return mnl_attr_put_check(nlh, buflen, type, sizeof(uint32_t), &data);
-}
-
-static inline struct nlattr *mnl_attr_nest_start_check(struct nlmsghdr *nlh, size_t buflen, uint16_t type) {
-    if (nlh->nlmsg_len + MNL_ATTR_HDRLEN > buflen)
-        return NULL;
-    return mnl_attr_nest_start(nlh, type);
-}
-static inline void mnl_attr_nest_end(struct nlmsghdr *nlh, struct nlattr *start) {
-    start->nla_len = (long)((char *)mnl_nlmsg_get_payload_tail(nlh)) - (long)((char *)start);
-}
-static inline void mnl_attr_nest_cancel(struct nlmsghdr *nlh, struct nlattr *start) {
-    nlh->nlmsg_len -= (long)((char *)mnl_nlmsg_get_payload_tail(nlh)) - (long)((char *)start);
-}
-
-static inline int mnl_cb_noop(__attribute__((unused)) const struct nlmsghdr *nlh, __attribute__((unused)) void *data) {
-    return MNL_CB_OK;
-}
-
-static inline int mnl_cb_error(const struct nlmsghdr *nlh, __attribute__((unused)) void *data) {
-    const struct nlmsgerr *err = (const struct nlmsgerr *)mnl_nlmsg_get_payload(nlh);
-
-    if (nlh->nlmsg_len < mnl_nlmsg_size(sizeof(struct nlmsgerr))) {
-        errno = EBADMSG;
-        return MNL_CB_ERROR;
-    }
-
-    if (err->error < 0)
-        errno = -err->error;
-    else
-        errno = err->error;
-
-    return err->error == 0 ? MNL_CB_STOP : MNL_CB_ERROR;
-}
-
-static inline int mnl_cb_stop(__attribute__((unused)) const struct nlmsghdr *nlh, __attribute__((unused)) void *data) {
-    return MNL_CB_STOP;
-}
-
-static inline mnl_cb_t get_default_cb(uint16_t type) {
-    switch (type) {
-    case NLMSG_NOOP:
-        return mnl_cb_noop;
-    case NLMSG_ERROR:
-        return mnl_cb_error;
-    case NLMSG_DONE:
-        return mnl_cb_stop;
-    case NLMSG_OVERRUN:
-        return mnl_cb_noop;
-    default:
-        return NULL;
-    }
-}
-
-static inline int __mnl_cb_run(const void *buf, size_t numbytes, unsigned int seq, unsigned int portid,
-                               mnl_cb_t cb_data, void *data, const mnl_cb_t *cb_ctl_array,
-                               unsigned int cb_ctl_array_len) {
-    int ret = MNL_CB_OK, len = numbytes;
-    const struct nlmsghdr *nlh = (const struct nlmsghdr *)buf;
-
-    while (mnl_nlmsg_ok(nlh, len)) {
-
-        if (!mnl_nlmsg_portid_ok(nlh, portid)) {
-            errno = ESRCH;
-            return -1;
-        }
-
-        if (!mnl_nlmsg_seq_ok(nlh, seq)) {
-            errno = EPROTO;
-            return -1;
-        }
-
-        if (nlh->nlmsg_flags & NLM_F_DUMP_INTR) {
-            errno = EINTR;
-            return -1;
-        }
-
-        if (nlh->nlmsg_type >= NLMSG_MIN_TYPE) {
-            if (cb_data) {
-                ret = cb_data(nlh, data);
-                if (ret <= MNL_CB_STOP)
-                    goto out;
-            }
-        } else if (nlh->nlmsg_type < cb_ctl_array_len) {
-            if (cb_ctl_array && cb_ctl_array[nlh->nlmsg_type]) {
-                ret = cb_ctl_array[nlh->nlmsg_type](nlh, data);
-                if (ret <= MNL_CB_STOP)
-                    goto out;
-            }
-        } else {
-            mnl_cb_t cb = get_default_cb(nlh->nlmsg_type);
-            if (cb) {
-                ret = cb(nlh, data);
-                if (ret <= MNL_CB_STOP)
-                    goto out;
+        explicit KeyB64(const char *src) {
+            if (src) {
+                std::strncpy(data.data(), src, KEY_B64_SIZE - 1);
+                data[KEY_B64_SIZE - 1] = '\0';
             }
         }
-        nlh = mnl_nlmsg_next(nlh, &len);
-    }
-out:
-    return ret;
-}
 
-static inline int mnl_cb_run2(const void *buf, size_t numbytes, unsigned int seq, unsigned int portid, mnl_cb_t cb_data,
-                              void *data, const mnl_cb_t *cb_ctl_array, unsigned int cb_ctl_array_len) {
-    return __mnl_cb_run(buf, numbytes, seq, portid, cb_data, data, cb_ctl_array, cb_ctl_array_len);
-}
-
-static inline int mnl_cb_run(const void *buf, size_t numbytes, unsigned int seq, unsigned int portid, mnl_cb_t cb_data,
-                             void *data) {
-    return __mnl_cb_run(buf, numbytes, seq, portid, cb_data, data, NULL, 0);
-}
-
-struct mnl_socket {
-    int fd;
-    struct sockaddr_nl addr;
-};
-
-static inline unsigned int mnl_socket_get_portid(const struct mnl_socket *nl) { return nl->addr.nl_pid; }
-
-static inline struct mnl_socket *__mnl_socket_open(int bus, int flags) {
-    struct mnl_socket *nl;
-
-    nl = (struct mnl_socket *)calloc(1, sizeof(struct mnl_socket));
-    if (nl == NULL)
-        return NULL;
-
-    nl->fd = socket(AF_NETLINK, SOCK_RAW | flags, bus);
-    if (nl->fd == -1) {
-        free(nl);
-        return NULL;
-    }
-
-    return nl;
-}
-
-static inline struct mnl_socket *mnl_socket_open(int bus) { return __mnl_socket_open(bus, 0); }
-
-static inline int mnl_socket_bind(struct mnl_socket *nl, unsigned int groups, pid_t pid) {
-    int ret;
-    socklen_t addr_len;
-
-    nl->addr.nl_family = AF_NETLINK;
-    nl->addr.nl_groups = groups;
-    nl->addr.nl_pid = pid;
-
-    ret = bind(nl->fd, (struct sockaddr *)&nl->addr, sizeof(nl->addr));
-    if (ret < 0)
-        return ret;
-
-    addr_len = sizeof(nl->addr);
-    ret = getsockname(nl->fd, (struct sockaddr *)&nl->addr, &addr_len);
-    if (ret < 0)
-        return ret;
-
-    if (addr_len != sizeof(nl->addr)) {
-        errno = EINVAL;
-        return -1;
-    }
-    if (nl->addr.nl_family != AF_NETLINK) {
-        errno = EINVAL;
-        return -1;
-    }
-    return 0;
-}
-
-static inline ssize_t mnl_socket_sendto(const struct mnl_socket *nl, const void *buf, size_t len) {
-    static const struct sockaddr_nl snl = {.nl_family = AF_NETLINK, .nl_pad = 0, .nl_pid = 0, .nl_groups = 0};
-    return sendto(nl->fd, buf, len, 0, (struct sockaddr *)&snl, sizeof(snl));
-}
-
-static inline ssize_t mnl_socket_recvfrom(const struct mnl_socket *nl, void *buf, size_t bufsiz) {
-    ssize_t ret;
-    struct sockaddr_nl addr;
-    struct iovec iov = {
-        .iov_base = buf,
-        .iov_len = bufsiz,
+        [[nodiscard]] auto c_str() const -> const char * { return data.data(); }
+        [[nodiscard]] auto raw() -> char * { return data.data(); }
     };
-    struct msghdr msg = {
-        .msg_name = &addr,
-        .msg_namelen = sizeof(struct sockaddr_nl),
-        .msg_iov = &iov,
-        .msg_iovlen = 1,
-        .msg_control = NULL,
-        .msg_controllen = 0,
-        .msg_flags = 0,
+
+    // =============================================================================
+    // Time Types
+    // =============================================================================
+
+    struct Timespec64 {
+        i64 tv_sec = 0;
+        i64 tv_nsec = 0;
     };
-    ret = recvmsg(nl->fd, &msg, 0);
-    if (ret == -1)
-        return ret;
 
-    if (msg.msg_flags & MSG_TRUNC) {
-        errno = ENOSPC;
-        return -1;
-    }
-    if (msg.msg_namelen != sizeof(struct sockaddr_nl)) {
-        errno = EINVAL;
-        return -1;
-    }
-    return ret;
-}
+    // =============================================================================
+    // Endpoint Type
+    // =============================================================================
 
-static inline int mnl_socket_close(struct mnl_socket *nl) {
-    int ret = close(nl->fd);
-    free(nl);
-    return ret;
-}
+    struct Endpoint {
+        union {
+            sockaddr addr;
+            sockaddr_in addr4;
+            sockaddr_in6 addr6;
+        };
 
-/* mnlg mini library: */
+        Endpoint() : addr6{} {}
 
-struct mnlg_socket {
-    struct mnl_socket *nl;
-    char *buf;
-    uint16_t id;
-    uint8_t version;
-    unsigned int seq;
-    unsigned int portid;
-};
+        [[nodiscard]] auto family() const -> u16 { return addr.sa_family; }
+        [[nodiscard]] auto is_ipv4() const -> bool { return family() == AF_INET; }
+        [[nodiscard]] auto is_ipv6() const -> bool { return family() == AF_INET6; }
+    };
 
-static inline struct nlmsghdr *__mnlg_msg_prepare(struct mnlg_socket *nlg, uint8_t cmd, uint16_t flags, uint16_t id,
-                                                  uint8_t version) {
-    struct nlmsghdr *nlh;
-    struct genlmsghdr *genl;
+    // =============================================================================
+    // Allowed IP
+    // =============================================================================
 
-    nlh = mnl_nlmsg_put_header(nlg->buf);
-    nlh->nlmsg_type = id;
-    nlh->nlmsg_flags = flags;
-    nlg->seq = time(NULL);
-    nlh->nlmsg_seq = nlg->seq;
+    class AllowedIp {
+      public:
+        u16 family = 0;
+        union {
+            in_addr ip4;
+            in6_addr ip6;
+        };
+        u8 cidr = 0;
 
-    genl = (struct genlmsghdr *)mnl_nlmsg_put_extra_header(nlh, sizeof(struct genlmsghdr));
-    genl->cmd = cmd;
-    genl->version = version;
+        AllowedIp() { std::memset(&ip6, 0, sizeof(ip6)); }
 
-    return nlh;
-}
+        [[nodiscard]] auto is_ipv4() const -> bool { return family == AF_INET; }
+        [[nodiscard]] auto is_ipv6() const -> bool { return family == AF_INET6; }
 
-static inline struct nlmsghdr *mnlg_msg_prepare(struct mnlg_socket *nlg, uint8_t cmd, uint16_t flags) {
-    return __mnlg_msg_prepare(nlg, cmd, flags, nlg->id, nlg->version);
-}
-
-static inline int mnlg_socket_send(struct mnlg_socket *nlg, const struct nlmsghdr *nlh) {
-    return mnl_socket_sendto(nlg->nl, nlh, nlh->nlmsg_len);
-}
-
-static inline int mnlg_cb_noop(const struct nlmsghdr *nlh, void *data) {
-    (void)nlh;
-    (void)data;
-    return MNL_CB_OK;
-}
-
-static inline int mnlg_cb_error(const struct nlmsghdr *nlh, void *data) {
-    const struct nlmsgerr *err = (const struct nlmsgerr *)mnl_nlmsg_get_payload(nlh);
-    (void)data;
-
-    if (nlh->nlmsg_len < mnl_nlmsg_size(sizeof(struct nlmsgerr))) {
-        errno = EBADMSG;
-        return MNL_CB_ERROR;
-    }
-    /* Netlink subsystems returns the errno value with different signess */
-    if (err->error < 0)
-        errno = -err->error;
-    else
-        errno = err->error;
-
-    return err->error == 0 ? MNL_CB_STOP : MNL_CB_ERROR;
-}
-
-static inline int mnlg_cb_stop(const struct nlmsghdr *nlh, void *data) {
-    (void)data;
-    if (nlh->nlmsg_flags & NLM_F_MULTI && nlh->nlmsg_len == mnl_nlmsg_size(sizeof(int))) {
-        int error = *(int *)mnl_nlmsg_get_payload(nlh);
-        /* Netlink subsystems returns the errno value with different signess */
-        if (error < 0)
-            errno = -error;
-        else
-            errno = error;
-
-        return error == 0 ? MNL_CB_STOP : MNL_CB_ERROR;
-    }
-    return MNL_CB_STOP;
-}
-
-static const mnl_cb_t mnlg_cb_array[] = {
-    mnlg_cb_noop,  // NLMSG_NOOP
-    mnlg_cb_error, // NLMSG_ERROR
-    mnlg_cb_stop,  // NLMSG_DONE
-    mnlg_cb_noop   // NLMSG_OVERRUN
-};
-
-static inline int mnlg_socket_recv_run(struct mnlg_socket *nlg, mnl_cb_t data_cb, void *data) {
-    int err;
-
-    do {
-        err = mnl_socket_recvfrom(nlg->nl, nlg->buf, mnl_ideal_socket_buffer_size());
-        if (err <= 0)
-            break;
-        err = mnl_cb_run2(nlg->buf, err, nlg->seq, nlg->portid, data_cb, data, mnlg_cb_array,
-                          MNL_ARRAY_SIZE(mnlg_cb_array));
-    } while (err > 0);
-
-    return err;
-}
-
-static inline int get_family_id_attr_cb(const struct nlattr *attr, void *data) {
-    const struct nlattr **tb = (const struct nlattr **)data;
-    int type = mnl_attr_get_type(attr);
-
-    if (mnl_attr_type_valid(attr, CTRL_ATTR_MAX) < 0)
-        return MNL_CB_ERROR;
-
-    if (type == CTRL_ATTR_FAMILY_ID && mnl_attr_validate(attr, MNL_TYPE_U16) < 0)
-        return MNL_CB_ERROR;
-    tb[type] = attr;
-    return MNL_CB_OK;
-}
-
-static inline int get_family_id_cb(const struct nlmsghdr *nlh, void *data) {
-    uint16_t *p_id = (uint16_t *)data;
-    struct nlattr *tb[CTRL_ATTR_MAX + 1] = {0};
-
-    mnl_attr_parse(nlh, sizeof(struct genlmsghdr), get_family_id_attr_cb, tb);
-    if (!tb[CTRL_ATTR_FAMILY_ID])
-        return MNL_CB_ERROR;
-    *p_id = mnl_attr_get_u16(tb[CTRL_ATTR_FAMILY_ID]);
-    return MNL_CB_OK;
-}
-
-static inline struct mnlg_socket *mnlg_socket_open(const char *family_name, uint8_t version) {
-    struct mnlg_socket *nlg;
-    struct nlmsghdr *nlh;
-    int err;
-
-    nlg = (struct mnlg_socket *)malloc(sizeof(*nlg));
-    if (!nlg)
-        return NULL;
-    nlg->id = 0;
-
-    err = -ENOMEM;
-    nlg->buf = (char *)malloc(mnl_ideal_socket_buffer_size());
-    if (!nlg->buf)
-        goto err_buf_alloc;
-
-    nlg->nl = mnl_socket_open(NETLINK_GENERIC);
-    if (!nlg->nl) {
-        err = -errno;
-        goto err_mnl_socket_open;
-    }
-
-    if (mnl_socket_bind(nlg->nl, 0, MNL_SOCKET_AUTOPID) < 0) {
-        err = -errno;
-        goto err_mnl_socket_bind;
-    }
-
-    nlg->portid = mnl_socket_get_portid(nlg->nl);
-
-    nlh = __mnlg_msg_prepare(nlg, CTRL_CMD_GETFAMILY, NLM_F_REQUEST | NLM_F_ACK, GENL_ID_CTRL, 1);
-    mnl_attr_put_strz(nlh, CTRL_ATTR_FAMILY_NAME, family_name);
-
-    if (mnlg_socket_send(nlg, nlh) < 0) {
-        err = -errno;
-        goto err_mnlg_socket_send;
-    }
-
-    errno = 0;
-    if (mnlg_socket_recv_run(nlg, get_family_id_cb, &nlg->id) < 0) {
-        errno = errno == ENOENT ? EPROTONOSUPPORT : errno;
-        err = errno ? -errno : -ENOSYS;
-        goto err_mnlg_socket_recv_run;
-    }
-
-    nlg->version = version;
-    errno = 0;
-    return nlg;
-
-err_mnlg_socket_recv_run:
-err_mnlg_socket_send:
-err_mnl_socket_bind:
-    mnl_socket_close(nlg->nl);
-err_mnl_socket_open:
-    free(nlg->buf);
-err_buf_alloc:
-    free(nlg);
-    errno = -err;
-    return NULL;
-}
-
-static inline void mnlg_socket_close(struct mnlg_socket *nlg) {
-    mnl_socket_close(nlg->nl);
-    free(nlg->buf);
-    free(nlg);
-}
-
-/* wireguard-specific parts: */
-
-struct string_list {
-    char *buffer;
-    size_t len;
-    size_t cap;
-};
-
-static inline int string_list_add(struct string_list *list, const char *str) {
-    size_t len = strlen(str) + 1;
-
-    if (len == 1)
-        return 0;
-
-    if (len >= list->cap - list->len) {
-        char *new_buffer;
-        size_t new_cap = list->cap * 2;
-
-        if (new_cap < list->len + len + 1)
-            new_cap = list->len + len + 1;
-        new_buffer = (char *)realloc(list->buffer, new_cap);
-        if (!new_buffer)
-            return -errno;
-        list->buffer = new_buffer;
-        list->cap = new_cap;
-    }
-    memcpy(list->buffer + list->len, str, len);
-    list->len += len;
-    list->buffer[list->len] = '\0';
-    return 0;
-}
-
-struct interface {
-    const char *name;
-    bool is_wireguard;
-};
-
-static inline int parse_linkinfo(const struct nlattr *attr, void *data) {
-    struct interface *interface = (struct interface *)data;
-
-    if (mnl_attr_get_type(attr) == IFLA_INFO_KIND && !strcmp(WG_GENL_NAME, mnl_attr_get_str(attr)))
-        interface->is_wireguard = true;
-    return MNL_CB_OK;
-}
-
-static inline int parse_infomsg(const struct nlattr *attr, void *data) {
-    struct interface *interface = (struct interface *)data;
-
-    if (mnl_attr_get_type(attr) == IFLA_LINKINFO)
-        return mnl_attr_parse_nested(attr, parse_linkinfo, data);
-    else if (mnl_attr_get_type(attr) == IFLA_IFNAME)
-        interface->name = mnl_attr_get_str(attr);
-    return MNL_CB_OK;
-}
-
-static inline int read_devices_cb(const struct nlmsghdr *nlh, void *data) {
-    struct string_list *list = (struct string_list *)data;
-    struct interface interface = {0};
-    int ret;
-
-    ret = mnl_attr_parse(nlh, sizeof(struct ifinfomsg), parse_infomsg, &interface);
-    if (ret != MNL_CB_OK)
-        return ret;
-    if (interface.name && interface.is_wireguard)
-        ret = string_list_add(list, interface.name);
-    if (ret < 0)
-        return ret;
-    if (nlh->nlmsg_type != NLMSG_DONE)
-        return MNL_CB_OK + 1;
-    return MNL_CB_OK;
-}
-
-static inline int fetch_device_names(struct string_list *list) {
-    struct mnl_socket *nl = NULL;
-    char *rtnl_buffer = NULL;
-    size_t message_len;
-    unsigned int portid, seq;
-    ssize_t len;
-    int ret = 0;
-    struct nlmsghdr *nlh;
-    struct ifinfomsg *ifm;
-
-    ret = -ENOMEM;
-    rtnl_buffer = (char *)calloc(mnl_ideal_socket_buffer_size(), 1);
-    if (!rtnl_buffer)
-        goto cleanup;
-
-    nl = mnl_socket_open(NETLINK_ROUTE);
-    if (!nl) {
-        ret = -errno;
-        goto cleanup;
-    }
-
-    if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) < 0) {
-        ret = -errno;
-        goto cleanup;
-    }
-
-    seq = time(NULL);
-    portid = mnl_socket_get_portid(nl);
-    nlh = mnl_nlmsg_put_header(rtnl_buffer);
-    nlh->nlmsg_type = RTM_GETLINK;
-    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_DUMP;
-    nlh->nlmsg_seq = seq;
-    ifm = (struct ifinfomsg *)mnl_nlmsg_put_extra_header(nlh, sizeof(*ifm));
-    ifm->ifi_family = AF_UNSPEC;
-    message_len = nlh->nlmsg_len;
-
-    if (mnl_socket_sendto(nl, rtnl_buffer, message_len) < 0) {
-        ret = -errno;
-        goto cleanup;
-    }
-
-another:
-    if ((len = mnl_socket_recvfrom(nl, rtnl_buffer, mnl_ideal_socket_buffer_size())) < 0) {
-        ret = -errno;
-        goto cleanup;
-    }
-    if ((len = mnl_cb_run(rtnl_buffer, len, seq, portid, read_devices_cb, list)) < 0) {
-        /* Netlink returns NLM_F_DUMP_INTR if the set of all tunnels changed
-         * during the dump. That's unfortunate, but is pretty common on busy
-         * systems that are adding and removing tunnels all the time. Rather
-         * than retrying, potentially indefinitely, we just work with the
-         * partial results. */
-        if (errno != EINTR) {
-            ret = -errno;
-            goto cleanup;
+        [[nodiscard]] auto is_valid() const -> bool {
+            if (family == AF_INET && cidr <= 32)
+                return true;
+            if (family == AF_INET6 && cidr <= 128)
+                return true;
+            return false;
         }
-    }
-    if (len == MNL_CB_OK + 1)
-        goto another;
-    ret = 0;
+    };
 
-cleanup:
-    free(rtnl_buffer);
-    if (nl)
-        mnl_socket_close(nl);
-    return ret;
-}
+    // =============================================================================
+    // Peer Flags
+    // =============================================================================
 
-static inline int add_del_iface(const char *ifname, bool add) {
-    struct mnl_socket *nl = NULL;
-    char *rtnl_buffer;
-    ssize_t len;
-    int ret;
-    struct nlmsghdr *nlh;
-    struct ifinfomsg *ifm;
-    struct nlattr *nest;
+    enum class PeerFlags : u32 {
+        None = 0,
+        RemoveMe = 1U << 0,
+        ReplaceAllowedIps = 1U << 1,
+        HasPublicKey = 1U << 2,
+        HasPresharedKey = 1U << 3,
+        HasPersistentKeepaliveInterval = 1U << 4
+    };
 
-    rtnl_buffer = (char *)calloc(mnl_ideal_socket_buffer_size(), 1);
-    if (!rtnl_buffer) {
-        ret = -ENOMEM;
-        goto cleanup;
+    inline auto operator|(PeerFlags a, PeerFlags b) -> PeerFlags {
+        return static_cast<PeerFlags>(static_cast<u32>(a) | static_cast<u32>(b));
     }
 
-    nl = mnl_socket_open(NETLINK_ROUTE);
-    if (!nl) {
-        ret = -errno;
-        goto cleanup;
+    inline auto operator&(PeerFlags a, PeerFlags b) -> PeerFlags {
+        return static_cast<PeerFlags>(static_cast<u32>(a) & static_cast<u32>(b));
     }
 
-    if (mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID) < 0) {
-        ret = -errno;
-        goto cleanup;
+    inline auto operator|=(PeerFlags &a, PeerFlags b) -> PeerFlags & {
+        a = a | b;
+        return a;
     }
 
-    nlh = mnl_nlmsg_put_header(rtnl_buffer);
-    nlh->nlmsg_type = add ? RTM_NEWLINK : RTM_DELLINK;
-    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | (add ? NLM_F_CREATE | NLM_F_EXCL : 0);
-    nlh->nlmsg_seq = time(NULL);
-    ifm = (struct ifinfomsg *)mnl_nlmsg_put_extra_header(nlh, sizeof(*ifm));
-    ifm->ifi_family = AF_UNSPEC;
-    mnl_attr_put_strz(nlh, IFLA_IFNAME, ifname);
-    nest = mnl_attr_nest_start(nlh, IFLA_LINKINFO);
-    mnl_attr_put_strz(nlh, IFLA_INFO_KIND, WG_GENL_NAME);
-    mnl_attr_nest_end(nlh, nest);
-
-    if (mnl_socket_sendto(nl, rtnl_buffer, nlh->nlmsg_len) < 0) {
-        ret = -errno;
-        goto cleanup;
+    inline auto has_flag(PeerFlags flags, PeerFlags flag) -> bool {
+        return (static_cast<u32>(flags) & static_cast<u32>(flag)) != 0;
     }
-    if ((len = mnl_socket_recvfrom(nl, rtnl_buffer, mnl_ideal_socket_buffer_size())) < 0) {
-        ret = -errno;
-        goto cleanup;
+
+    // =============================================================================
+    // Device Flags
+    // =============================================================================
+
+    enum class DeviceFlags : u32 {
+        None = 0,
+        ReplacePeers = 1U << 0,
+        HasPrivateKey = 1U << 1,
+        HasPublicKey = 1U << 2,
+        HasListenPort = 1U << 3,
+        HasFwmark = 1U << 4
+    };
+
+    inline auto operator|(DeviceFlags a, DeviceFlags b) -> DeviceFlags {
+        return static_cast<DeviceFlags>(static_cast<u32>(a) | static_cast<u32>(b));
     }
-    if (mnl_cb_run(rtnl_buffer, len, nlh->nlmsg_seq, mnl_socket_get_portid(nl), NULL, NULL) < 0) {
-        ret = -errno;
-        goto cleanup;
+
+    inline auto operator&(DeviceFlags a, DeviceFlags b) -> DeviceFlags {
+        return static_cast<DeviceFlags>(static_cast<u32>(a) & static_cast<u32>(b));
     }
-    ret = 0;
 
-cleanup:
-    free(rtnl_buffer);
-    if (nl)
-        mnl_socket_close(nl);
-    return ret;
-}
-
-inline int wg_set_device(wg_device *dev) {
-    int ret = 0;
-    wg_peer *peer = NULL;
-    wg_allowedip *allowedip = NULL;
-    struct nlattr *peers_nest, *peer_nest, *allowedips_nest, *allowedip_nest;
-    struct nlmsghdr *nlh;
-    struct mnlg_socket *nlg;
-
-    nlg = mnlg_socket_open(WG_GENL_NAME, WG_GENL_VERSION);
-    if (!nlg)
-        return -errno;
-
-again:
-    nlh = mnlg_msg_prepare(nlg, WG_CMD_SET_DEVICE, NLM_F_REQUEST | NLM_F_ACK);
-    mnl_attr_put_strz(nlh, WGDEVICE_A_IFNAME, dev->name);
-
-    if (!peer) {
-        uint32_t flags = 0;
-
-        if (dev->flags & WGDEVICE_HAS_PRIVATE_KEY)
-            mnl_attr_put(nlh, WGDEVICE_A_PRIVATE_KEY, sizeof(dev->private_key), dev->private_key);
-        if (dev->flags & WGDEVICE_HAS_LISTEN_PORT)
-            mnl_attr_put_u16(nlh, WGDEVICE_A_LISTEN_PORT, dev->listen_port);
-        if (dev->flags & WGDEVICE_HAS_FWMARK)
-            mnl_attr_put_u32(nlh, WGDEVICE_A_FWMARK, dev->fwmark);
-        if (dev->flags & WGDEVICE_REPLACE_PEERS)
-            flags |= WGDEVICE_F_REPLACE_PEERS;
-        if (flags)
-            mnl_attr_put_u32(nlh, WGDEVICE_A_FLAGS, flags);
+    inline auto operator|=(DeviceFlags &a, DeviceFlags b) -> DeviceFlags & {
+        a = a | b;
+        return a;
     }
-    if (!dev->first_peer)
-        goto send;
-    peers_nest = peer_nest = allowedips_nest = allowedip_nest = NULL;
-    peers_nest = mnl_attr_nest_start(nlh, WGDEVICE_A_PEERS);
-    for (peer = peer ? peer : dev->first_peer; peer; peer = peer->next_peer) {
-        uint32_t flags = 0;
 
-        peer_nest = mnl_attr_nest_start_check(nlh, mnl_ideal_socket_buffer_size(), 0);
-        if (!peer_nest)
-            goto toobig_peers;
-        if (!mnl_attr_put_check(nlh, mnl_ideal_socket_buffer_size(), WGPEER_A_PUBLIC_KEY, sizeof(peer->public_key),
-                                peer->public_key))
-            goto toobig_peers;
-        if (peer->flags & WGPEER_REMOVE_ME)
-            flags |= WGPEER_F_REMOVE_ME;
-        if (!allowedip) {
-            if (peer->flags & WGPEER_REPLACE_ALLOWEDIPS)
-                flags |= WGPEER_F_REPLACE_ALLOWEDIPS;
-            if (peer->flags & WGPEER_HAS_PRESHARED_KEY) {
-                if (!mnl_attr_put_check(nlh, mnl_ideal_socket_buffer_size(), WGPEER_A_PRESHARED_KEY,
-                                        sizeof(peer->preshared_key), peer->preshared_key))
-                    goto toobig_peers;
-            }
-            if (peer->endpoint.addr.sa_family == AF_INET) {
-                if (!mnl_attr_put_check(nlh, mnl_ideal_socket_buffer_size(), WGPEER_A_ENDPOINT,
-                                        sizeof(peer->endpoint.addr4), &peer->endpoint.addr4))
-                    goto toobig_peers;
-            } else if (peer->endpoint.addr.sa_family == AF_INET6) {
-                if (!mnl_attr_put_check(nlh, mnl_ideal_socket_buffer_size(), WGPEER_A_ENDPOINT,
-                                        sizeof(peer->endpoint.addr6), &peer->endpoint.addr6))
-                    goto toobig_peers;
-            }
-            if (peer->flags & WGPEER_HAS_PERSISTENT_KEEPALIVE_INTERVAL) {
-                if (!mnl_attr_put_u16_check(nlh, mnl_ideal_socket_buffer_size(), WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL,
-                                            peer->persistent_keepalive_interval))
-                    goto toobig_peers;
+    inline auto has_flag(DeviceFlags flags, DeviceFlags flag) -> bool {
+        return (static_cast<u32>(flags) & static_cast<u32>(flag)) != 0;
+    }
+
+    // =============================================================================
+    // Peer Class
+    // =============================================================================
+
+    class Peer {
+      public:
+        PeerFlags flags = PeerFlags::None;
+        Key public_key;
+        Key preshared_key;
+        Endpoint endpoint;
+        Timespec64 last_handshake_time;
+        u64 rx_bytes = 0;
+        u64 tx_bytes = 0;
+        u16 persistent_keepalive_interval = 0;
+        Vector<AllowedIp> allowed_ips;
+
+        Peer() = default;
+
+        [[nodiscard]] auto has_public_key() const -> bool { return has_flag(flags, PeerFlags::HasPublicKey); }
+
+        [[nodiscard]] auto has_preshared_key() const -> bool { return has_flag(flags, PeerFlags::HasPresharedKey); }
+
+        [[nodiscard]] auto should_remove() const -> bool { return has_flag(flags, PeerFlags::RemoveMe); }
+
+        [[nodiscard]] auto should_replace_allowed_ips() const -> bool {
+            return has_flag(flags, PeerFlags::ReplaceAllowedIps);
+        }
+
+        auto add_allowed_ip(AllowedIp ip) -> void { allowed_ips.push_back(ip); }
+    };
+
+    // =============================================================================
+    // Device Class
+    // =============================================================================
+
+    class Device {
+      public:
+        Array<char, IFNAMSIZ> name{};
+        u32 ifindex = 0;
+        DeviceFlags flags = DeviceFlags::None;
+        Key public_key;
+        Key private_key;
+        u32 fwmark = 0;
+        u16 listen_port = 0;
+        Vector<Peer> peers;
+
+        Device() = default;
+
+        explicit Device(const char *device_name) {
+            if (device_name) {
+                std::strncpy(name.data(), device_name, IFNAMSIZ - 1);
+                name[IFNAMSIZ - 1] = '\0';
             }
         }
-        if (flags) {
-            if (!mnl_attr_put_u32_check(nlh, mnl_ideal_socket_buffer_size(), WGPEER_A_FLAGS, flags))
-                goto toobig_peers;
-        }
-        if (peer->first_allowedip) {
-            if (!allowedip)
-                allowedip = peer->first_allowedip;
-            allowedips_nest = mnl_attr_nest_start_check(nlh, mnl_ideal_socket_buffer_size(), WGPEER_A_ALLOWEDIPS);
-            if (!allowedips_nest)
-                goto toobig_allowedips;
-            for (; allowedip; allowedip = allowedip->next_allowedip) {
-                allowedip_nest = mnl_attr_nest_start_check(nlh, mnl_ideal_socket_buffer_size(), 0);
-                if (!allowedip_nest)
-                    goto toobig_allowedips;
-                if (!mnl_attr_put_u16_check(nlh, mnl_ideal_socket_buffer_size(), WGALLOWEDIP_A_FAMILY,
-                                            allowedip->family))
-                    goto toobig_allowedips;
-                if (allowedip->family == AF_INET) {
-                    if (!mnl_attr_put_check(nlh, mnl_ideal_socket_buffer_size(), WGALLOWEDIP_A_IPADDR,
-                                            sizeof(allowedip->ip4), &allowedip->ip4))
-                        goto toobig_allowedips;
-                } else if (allowedip->family == AF_INET6) {
-                    if (!mnl_attr_put_check(nlh, mnl_ideal_socket_buffer_size(), WGALLOWEDIP_A_IPADDR,
-                                            sizeof(allowedip->ip6), &allowedip->ip6))
-                        goto toobig_allowedips;
+
+        [[nodiscard]] auto get_name() const -> const char * { return name.data(); }
+
+        [[nodiscard]] auto has_private_key() const -> bool { return has_flag(flags, DeviceFlags::HasPrivateKey); }
+
+        [[nodiscard]] auto has_public_key() const -> bool { return has_flag(flags, DeviceFlags::HasPublicKey); }
+
+        [[nodiscard]] auto has_listen_port() const -> bool { return has_flag(flags, DeviceFlags::HasListenPort); }
+
+        [[nodiscard]] auto has_fwmark() const -> bool { return has_flag(flags, DeviceFlags::HasFwmark); }
+
+        [[nodiscard]] auto should_replace_peers() const -> bool { return has_flag(flags, DeviceFlags::ReplacePeers); }
+
+        auto add_peer(Peer peer) -> void { peers.push_back(std::move(peer)); }
+
+        auto find_peer(const Key &pub_key) -> Optional<Peer *> {
+            for (auto &peer : peers) {
+                if (peer.public_key == pub_key) {
+                    return &peer;
                 }
-                if (!mnl_attr_put_u8_check(nlh, mnl_ideal_socket_buffer_size(), WGALLOWEDIP_A_CIDR_MASK,
-                                           allowedip->cidr))
-                    goto toobig_allowedips;
-                mnl_attr_nest_end(nlh, allowedip_nest);
-                allowedip_nest = NULL;
             }
-            mnl_attr_nest_end(nlh, allowedips_nest);
-            allowedips_nest = NULL;
+            return {};
+        }
+    };
+
+    // =============================================================================
+    // Netlink Attribute Commands
+    // =============================================================================
+
+    enum class WgCmd : u8 { GetDevice = 0, SetDevice = 1 };
+
+    enum class WgDeviceAttr : u16 {
+        Unspec = 0,
+        Ifindex = 1,
+        Ifname = 2,
+        PrivateKey = 3,
+        PublicKey = 4,
+        Flags = 5,
+        ListenPort = 6,
+        Fwmark = 7,
+        Peers = 8
+    };
+
+    enum class WgPeerAttr : u16 {
+        Unspec = 0,
+        PublicKey = 1,
+        PresharedKey = 2,
+        Flags = 3,
+        Endpoint = 4,
+        PersistentKeepaliveInterval = 5,
+        LastHandshakeTime = 6,
+        RxBytes = 7,
+        TxBytes = 8,
+        AllowedIps = 9,
+        ProtocolVersion = 10
+    };
+
+    enum class WgAllowedIpAttr : u16 { Unspec = 0, Family = 1, IpAddr = 2, CidrMask = 3 };
+
+    // =============================================================================
+    // Netlink Constants
+    // =============================================================================
+
+    namespace nl {
+
+        inline constexpr usize ALIGNTO = 4;
+        inline constexpr auto ALIGN(usize len) -> usize { return (len + ALIGNTO - 1) & ~(ALIGNTO - 1); }
+        inline constexpr auto HDRLEN() -> usize { return ALIGN(sizeof(nlmsghdr)); }
+        inline constexpr auto ATTR_HDRLEN() -> usize { return ALIGN(sizeof(nlattr)); }
+
+        inline auto ideal_socket_buffer_size() -> usize {
+            static usize size = 0;
+            if (size == 0) {
+                size = static_cast<usize>(sysconf(_SC_PAGESIZE));
+                if (size > 8192)
+                    size = 8192;
+            }
+            return size;
         }
 
-        mnl_attr_nest_end(nlh, peer_nest);
-        peer_nest = NULL;
-    }
-    mnl_attr_nest_end(nlh, peers_nest);
-    peers_nest = NULL;
-    goto send;
-toobig_allowedips:
-    if (allowedip_nest)
-        mnl_attr_nest_cancel(nlh, allowedip_nest);
-    if (allowedips_nest)
-        mnl_attr_nest_end(nlh, allowedips_nest);
-    mnl_attr_nest_end(nlh, peer_nest);
-    mnl_attr_nest_end(nlh, peers_nest);
-    goto send;
-toobig_peers:
-    if (peer_nest)
-        mnl_attr_nest_cancel(nlh, peer_nest);
-    mnl_attr_nest_end(nlh, peers_nest);
-    goto send;
-send:
-    if (mnlg_socket_send(nlg, nlh) < 0) {
-        ret = -errno;
-        goto out;
-    }
-    errno = 0;
-    if (mnlg_socket_recv_run(nlg, NULL, NULL) < 0) {
-        ret = errno ? -errno : -EINVAL;
-        goto out;
-    }
-    if (peer)
-        goto again;
+    } // namespace nl
 
-out:
-    mnlg_socket_close(nlg);
-    errno = -ret;
-    return ret;
-}
+    // =============================================================================
+    // Netlink Message Builder
+    // =============================================================================
 
-static inline int parse_allowedip(const struct nlattr *attr, void *data) {
-    wg_allowedip *allowedip = (wg_allowedip *)data;
+    class NetlinkMessage {
+      private:
+        Vector<u8> buffer_;
+        nlmsghdr *header_ = nullptr;
 
-    switch (mnl_attr_get_type(attr)) {
-    case WGALLOWEDIP_A_UNSPEC:
-        break;
-    case WGALLOWEDIP_A_FAMILY:
-        if (!mnl_attr_validate(attr, MNL_TYPE_U16))
-            allowedip->family = mnl_attr_get_u16(attr);
-        break;
-    case WGALLOWEDIP_A_IPADDR:
-        if (mnl_attr_get_payload_len(attr) == sizeof(allowedip->ip4))
-            memcpy(&allowedip->ip4, mnl_attr_get_payload(attr), sizeof(allowedip->ip4));
-        else if (mnl_attr_get_payload_len(attr) == sizeof(allowedip->ip6))
-            memcpy(&allowedip->ip6, mnl_attr_get_payload(attr), sizeof(allowedip->ip6));
-        break;
-    case WGALLOWEDIP_A_CIDR_MASK:
-        if (!mnl_attr_validate(attr, MNL_TYPE_U8))
-            allowedip->cidr = mnl_attr_get_u8(attr);
-        break;
-    }
-
-    return MNL_CB_OK;
-}
-
-static inline int parse_allowedips(const struct nlattr *attr, void *data) {
-    wg_peer *peer = (wg_peer *)data;
-    wg_allowedip *new_allowedip = (wg_allowedip *)calloc(1, sizeof(wg_allowedip));
-    int ret;
-
-    if (!new_allowedip)
-        return MNL_CB_ERROR;
-    if (!peer->first_allowedip)
-        peer->first_allowedip = peer->last_allowedip = new_allowedip;
-    else {
-        peer->last_allowedip->next_allowedip = new_allowedip;
-        peer->last_allowedip = new_allowedip;
-    }
-    ret = mnl_attr_parse_nested(attr, parse_allowedip, new_allowedip);
-    if (!ret)
-        return ret;
-    if (!((new_allowedip->family == AF_INET && new_allowedip->cidr <= 32) ||
-          (new_allowedip->family == AF_INET6 && new_allowedip->cidr <= 128))) {
-        errno = EAFNOSUPPORT;
-        return MNL_CB_ERROR;
-    }
-    return MNL_CB_OK;
-}
-
-inline bool wg_key_is_zero(const wg_key key) {
-    volatile uint8_t acc = 0;
-    unsigned int i;
-
-    for (i = 0; i < sizeof(wg_key); ++i) {
-        acc |= key[i];
-        __asm__("" : "=r"(acc) : "0"(acc));
-    }
-    return 1 & ((acc - 1) >> 8);
-}
-
-static inline int parse_peer(const struct nlattr *attr, void *data) {
-    wg_peer *peer = (wg_peer *)data;
-
-    switch (mnl_attr_get_type(attr)) {
-    case WGPEER_A_UNSPEC:
-        break;
-    case WGPEER_A_PUBLIC_KEY:
-        if (mnl_attr_get_payload_len(attr) == sizeof(peer->public_key)) {
-            memcpy(peer->public_key, mnl_attr_get_payload(attr), sizeof(peer->public_key));
-            peer->flags = (enum wg_peer_flags)(peer->flags | WGPEER_HAS_PUBLIC_KEY);
+      public:
+        explicit NetlinkMessage(usize initial_size = 0) {
+            usize size = initial_size > 0 ? initial_size : nl::ideal_socket_buffer_size();
+            buffer_.resize(size);
+            std::memset(buffer_.data(), 0, size);
+            header_ = reinterpret_cast<nlmsghdr *>(buffer_.data());
+            header_->nlmsg_len = nl::HDRLEN();
         }
-        break;
-    case WGPEER_A_PRESHARED_KEY:
-        if (mnl_attr_get_payload_len(attr) == sizeof(peer->preshared_key)) {
-            memcpy(peer->preshared_key, mnl_attr_get_payload(attr), sizeof(peer->preshared_key));
-            if (!wg_key_is_zero(peer->preshared_key))
-                peer->flags = (enum wg_peer_flags)(peer->flags | WGPEER_HAS_PRESHARED_KEY);
+
+        [[nodiscard]] auto header() -> nlmsghdr * { return header_; }
+        [[nodiscard]] auto header() const -> const nlmsghdr * { return header_; }
+        [[nodiscard]] auto data() -> u8 * { return buffer_.data(); }
+        [[nodiscard]] auto data() const -> const u8 * { return buffer_.data(); }
+        [[nodiscard]] auto capacity() const -> usize { return buffer_.size(); }
+        [[nodiscard]] auto length() const -> u32 { return header_->nlmsg_len; }
+
+        [[nodiscard]] auto payload() -> void * { return reinterpret_cast<char *>(header_) + nl::HDRLEN(); }
+
+        [[nodiscard]] auto payload_tail() -> void * {
+            return reinterpret_cast<char *>(header_) + nl::ALIGN(header_->nlmsg_len);
         }
-        break;
-    case WGPEER_A_ENDPOINT: {
-        struct sockaddr *addr;
 
-        if (mnl_attr_get_payload_len(attr) < sizeof(*addr))
-            break;
-        addr = (struct sockaddr *)mnl_attr_get_payload(attr);
-        if (addr->sa_family == AF_INET && mnl_attr_get_payload_len(attr) == sizeof(peer->endpoint.addr4))
-            memcpy(&peer->endpoint.addr4, addr, sizeof(peer->endpoint.addr4));
-        else if (addr->sa_family == AF_INET6 && mnl_attr_get_payload_len(attr) == sizeof(peer->endpoint.addr6))
-            memcpy(&peer->endpoint.addr6, addr, sizeof(peer->endpoint.addr6));
-        break;
-    }
-    case WGPEER_A_PERSISTENT_KEEPALIVE_INTERVAL:
-        if (!mnl_attr_validate(attr, MNL_TYPE_U16))
-            peer->persistent_keepalive_interval = mnl_attr_get_u16(attr);
-        break;
-    case WGPEER_A_LAST_HANDSHAKE_TIME:
-        if (mnl_attr_get_payload_len(attr) == sizeof(peer->last_handshake_time))
-            memcpy(&peer->last_handshake_time, mnl_attr_get_payload(attr), sizeof(peer->last_handshake_time));
-        break;
-    case WGPEER_A_RX_BYTES:
-        if (!mnl_attr_validate(attr, MNL_TYPE_U64))
-            peer->rx_bytes = mnl_attr_get_u64(attr);
-        break;
-    case WGPEER_A_TX_BYTES:
-        if (!mnl_attr_validate(attr, MNL_TYPE_U64))
-            peer->tx_bytes = mnl_attr_get_u64(attr);
-        break;
-    case WGPEER_A_ALLOWEDIPS:
-        return mnl_attr_parse_nested(attr, parse_allowedips, peer);
-    }
-
-    return MNL_CB_OK;
-}
-
-static inline int parse_peers(const struct nlattr *attr, void *data) {
-    wg_device *device = (wg_device *)data;
-    wg_peer *new_peer = (wg_peer *)calloc(1, sizeof(wg_peer));
-    int ret;
-
-    if (!new_peer)
-        return MNL_CB_ERROR;
-    if (!device->first_peer)
-        device->first_peer = device->last_peer = new_peer;
-    else {
-        device->last_peer->next_peer = new_peer;
-        device->last_peer = new_peer;
-    }
-    ret = mnl_attr_parse_nested(attr, parse_peer, new_peer);
-    if (!ret)
-        return ret;
-    if (!(new_peer->flags & WGPEER_HAS_PUBLIC_KEY)) {
-        errno = ENXIO;
-        return MNL_CB_ERROR;
-    }
-    return MNL_CB_OK;
-}
-
-static inline int parse_device(const struct nlattr *attr, void *data) {
-    wg_device *device = (wg_device *)data;
-
-    switch (mnl_attr_get_type(attr)) {
-    case WGDEVICE_A_UNSPEC:
-        break;
-    case WGDEVICE_A_IFINDEX:
-        if (!mnl_attr_validate(attr, MNL_TYPE_U32))
-            device->ifindex = mnl_attr_get_u32(attr);
-        break;
-    case WGDEVICE_A_IFNAME:
-        if (!mnl_attr_validate(attr, MNL_TYPE_STRING)) {
-            strncpy(device->name, mnl_attr_get_str(attr), sizeof(device->name) - 1);
-            device->name[sizeof(device->name) - 1] = '\0';
+        template <typename T> auto put_extra_header() -> T * {
+            auto *ptr = reinterpret_cast<T *>(payload_tail());
+            usize len = nl::ALIGN(sizeof(T));
+            header_->nlmsg_len += len;
+            std::memset(ptr, 0, len);
+            return ptr;
         }
-        break;
-    case WGDEVICE_A_PRIVATE_KEY:
-        if (mnl_attr_get_payload_len(attr) == sizeof(device->private_key)) {
-            memcpy(device->private_key, mnl_attr_get_payload(attr), sizeof(device->private_key));
-            device->flags = (enum wg_device_flags)(device->flags | WGDEVICE_HAS_PRIVATE_KEY);
+
+        auto put_attr(u16 type, const void *data, usize len) -> bool {
+            if (header_->nlmsg_len + nl::ATTR_HDRLEN() + nl::ALIGN(len) > capacity()) {
+                return false;
+            }
+
+            auto *attr = reinterpret_cast<nlattr *>(payload_tail());
+            u16 payload_len = nl::ALIGN(sizeof(nlattr)) + len;
+            attr->nla_type = type;
+            attr->nla_len = payload_len;
+
+            std::memcpy(reinterpret_cast<char *>(attr) + nl::ATTR_HDRLEN(), data, len);
+            header_->nlmsg_len += nl::ALIGN(payload_len);
+
+            // Zero padding
+            usize pad = nl::ALIGN(len) - len;
+            if (pad > 0) {
+                std::memset(reinterpret_cast<char *>(attr) + nl::ATTR_HDRLEN() + len, 0, pad);
+            }
+            return true;
         }
-        break;
-    case WGDEVICE_A_PUBLIC_KEY:
-        if (mnl_attr_get_payload_len(attr) == sizeof(device->public_key)) {
-            memcpy(device->public_key, mnl_attr_get_payload(attr), sizeof(device->public_key));
-            device->flags = (enum wg_device_flags)(device->flags | WGDEVICE_HAS_PUBLIC_KEY);
+
+        auto put_attr_u8(u16 type, u8 value) -> bool { return put_attr(type, &value, sizeof(u8)); }
+
+        auto put_attr_u16(u16 type, u16 value) -> bool { return put_attr(type, &value, sizeof(u16)); }
+
+        auto put_attr_u32(u16 type, u32 value) -> bool { return put_attr(type, &value, sizeof(u32)); }
+
+        auto put_attr_strz(u16 type, const char *str) -> bool { return put_attr(type, str, std::strlen(str) + 1); }
+
+        auto nest_start(u16 type) -> nlattr * {
+            if (header_->nlmsg_len + nl::ATTR_HDRLEN() > capacity()) {
+                return nullptr;
+            }
+
+            auto *start = reinterpret_cast<nlattr *>(payload_tail());
+            start->nla_type = NLA_F_NESTED | type;
+            header_->nlmsg_len += nl::ALIGN(sizeof(nlattr));
+            return start;
         }
-        break;
-    case WGDEVICE_A_LISTEN_PORT:
-        if (!mnl_attr_validate(attr, MNL_TYPE_U16))
-            device->listen_port = mnl_attr_get_u16(attr);
-        break;
-    case WGDEVICE_A_FWMARK:
-        if (!mnl_attr_validate(attr, MNL_TYPE_U32))
-            device->fwmark = mnl_attr_get_u32(attr);
-        break;
-    case WGDEVICE_A_PEERS:
-        return mnl_attr_parse_nested(attr, parse_peers, device);
-    }
 
-    return MNL_CB_OK;
-}
-
-static inline int read_device_cb(const struct nlmsghdr *nlh, void *data) {
-    return mnl_attr_parse(nlh, sizeof(struct genlmsghdr), parse_device, data);
-}
-
-static inline void coalesce_peers(wg_device *device) {
-    wg_peer *old_next_peer, *peer = device->first_peer;
-
-    while (peer && peer->next_peer) {
-        if (memcmp(peer->public_key, peer->next_peer->public_key, sizeof(wg_key))) {
-            peer = peer->next_peer;
-            continue;
+        auto nest_end(nlattr *start) -> void {
+            start->nla_len = reinterpret_cast<char *>(payload_tail()) - reinterpret_cast<char *>(start);
         }
-        if (!peer->first_allowedip) {
-            peer->first_allowedip = peer->next_peer->first_allowedip;
-            peer->last_allowedip = peer->next_peer->last_allowedip;
-        } else {
-            peer->last_allowedip->next_allowedip = peer->next_peer->first_allowedip;
-            peer->last_allowedip = peer->next_peer->last_allowedip;
+
+        auto nest_cancel(nlattr *start) -> void {
+            header_->nlmsg_len -= reinterpret_cast<char *>(payload_tail()) - reinterpret_cast<char *>(start);
         }
-        old_next_peer = peer->next_peer;
-        peer->next_peer = old_next_peer->next_peer;
-        free(old_next_peer);
-    }
-}
+    };
 
-inline int wg_get_device(wg_device **device, const char *device_name) {
-    int ret = 0;
-    struct nlmsghdr *nlh;
-    struct mnlg_socket *nlg;
+    // =============================================================================
+    // Netlink Socket
+    // =============================================================================
 
-try_again:
-    *device = (wg_device *)calloc(1, sizeof(wg_device));
-    if (!*device)
-        return -errno;
+    class NetlinkSocket {
+      private:
+        int fd_ = -1;
+        sockaddr_nl addr_{};
 
-    nlg = mnlg_socket_open(WG_GENL_NAME, WG_GENL_VERSION);
-    if (!nlg) {
-        wg_free_device(*device);
-        *device = NULL;
-        return -errno;
-    }
+      public:
+        NetlinkSocket() = default;
 
-    nlh = mnlg_msg_prepare(nlg, WG_CMD_GET_DEVICE, NLM_F_REQUEST | NLM_F_ACK | NLM_F_DUMP);
-    mnl_attr_put_strz(nlh, WGDEVICE_A_IFNAME, device_name);
-    if (mnlg_socket_send(nlg, nlh) < 0) {
-        ret = -errno;
-        goto out;
-    }
-    errno = 0;
-    if (mnlg_socket_recv_run(nlg, read_device_cb, *device) < 0) {
-        ret = errno ? -errno : -EINVAL;
-        goto out;
-    }
-    coalesce_peers(*device);
+        ~NetlinkSocket() { close(); }
 
-out:
-    if (nlg)
-        mnlg_socket_close(nlg);
-    if (ret) {
-        wg_free_device(*device);
-        if (ret == -EINTR)
-            goto try_again;
-        *device = NULL;
-    }
-    errno = -ret;
-    return ret;
-}
+        // Non-copyable
+        NetlinkSocket(const NetlinkSocket &) = delete;
+        auto operator=(const NetlinkSocket &) -> NetlinkSocket & = delete;
 
-/* first\0second\0third\0forth\0last\0\0 */
-inline char *wg_list_device_names(void) {
-    struct string_list list = {0};
-    int ret = fetch_device_names(&list);
+        // Movable
+        NetlinkSocket(NetlinkSocket &&other) noexcept : fd_(other.fd_), addr_(other.addr_) { other.fd_ = -1; }
 
-    errno = -ret;
-    if (errno) {
-        free(list.buffer);
-        return NULL;
-    }
-    return list.buffer ? (char *)strdup("\0") : (char *)list.buffer;
-}
-
-inline int wg_add_device(const char *device_name) { return add_del_iface(device_name, true); }
-
-inline int wg_del_device(const char *device_name) { return add_del_iface(device_name, false); }
-
-inline void wg_free_device(wg_device *dev) {
-    wg_peer *peer, *np;
-    wg_allowedip *allowedip, *na;
-
-    if (!dev)
-        return;
-    for (peer = dev->first_peer, np = peer ? peer->next_peer : NULL; peer;
-         peer = np, np = peer ? peer->next_peer : NULL) {
-        for (allowedip = peer->first_allowedip, na = allowedip ? allowedip->next_allowedip : NULL; allowedip;
-             allowedip = na, na = allowedip ? allowedip->next_allowedip : NULL)
-            free(allowedip);
-        free(peer);
-    }
-    free(dev);
-}
-
-static inline void encode_base64(char dest[4], const uint8_t src[3]) {
-    const uint8_t input[] = {(src[0] >> 2) & 63, ((src[0] << 4) | (src[1] >> 4)) & 63,
-                             ((src[1] << 2) | (src[2] >> 6)) & 63, src[2] & 63};
-    unsigned int i;
-
-    for (i = 0; i < 4; ++i)
-        dest[i] = input[i] + 'A' + (((25 - input[i]) >> 8) & 6) - (((51 - input[i]) >> 8) & 75) -
-                  (((61 - input[i]) >> 8) & 15) + (((62 - input[i]) >> 8) & 3);
-}
-
-inline void wg_key_to_base64(wg_key_b64_string base64, const wg_key key) {
-    unsigned int i;
-
-    for (i = 0; i < 32 / 3; ++i)
-        encode_base64(&base64[i * 4], &key[i * 3]);
-    {
-        const uint8_t temp[3] = {key[i * 3 + 0], key[i * 3 + 1], 0};
-        encode_base64(&base64[i * 4], temp);
-    }
-    base64[sizeof(wg_key_b64_string) - 2] = '=';
-    base64[sizeof(wg_key_b64_string) - 1] = '\0';
-}
-
-static inline int decode_base64(const char src[4]) {
-    int val = 0;
-    unsigned int i;
-
-    for (i = 0; i < 4; ++i)
-        val |= (-1 + ((((('A' - 1) - src[i]) & (src[i] - ('Z' + 1))) >> 8) & (src[i] - 64)) +
-                ((((('a' - 1) - src[i]) & (src[i] - ('z' + 1))) >> 8) & (src[i] - 70)) +
-                ((((('0' - 1) - src[i]) & (src[i] - ('9' + 1))) >> 8) & (src[i] + 5)) +
-                ((((('+' - 1) - src[i]) & (src[i] - ('+' + 1))) >> 8) & 63) +
-                ((((('/' - 1) - src[i]) & (src[i] - ('/' + 1))) >> 8) & 64))
-               << (18 - 6 * i);
-    return val;
-}
-
-inline int wg_key_from_base64(wg_key key, const wg_key_b64_string base64) {
-    unsigned int i;
-    int val;
-    volatile uint8_t ret = 0;
-
-    if (strlen(base64) != sizeof(wg_key_b64_string) - 1 || base64[sizeof(wg_key_b64_string) - 2] != '=') {
-        errno = EINVAL;
-        goto out;
-    }
-
-    for (i = 0; i < 32 / 3; ++i) {
-        val = decode_base64(&base64[i * 4]);
-        ret |= (uint32_t)val >> 31;
-        key[i * 3 + 0] = (val >> 16) & 0xff;
-        key[i * 3 + 1] = (val >> 8) & 0xff;
-        key[i * 3 + 2] = val & 0xff;
-    }
-    {
-        const char temp[4] = {base64[i * 4 + 0], base64[i * 4 + 1], base64[i * 4 + 2], 'A'};
-        val = decode_base64(temp);
-    }
-    ret |= ((uint32_t)val >> 31) | (val & 0xff);
-    key[i * 3 + 0] = (val >> 16) & 0xff;
-    key[i * 3 + 1] = (val >> 8) & 0xff;
-    errno = EINVAL & ~((ret - 1) >> 8);
-out:
-    return -errno;
-}
-
-typedef int64_t fe[16];
-
-static inline __attribute__((noinline)) void memzero_explicit(void *s, size_t count) {
-    memset(s, 0, count);
-    __asm__ __volatile__("" : : "r"(s) : "memory");
-}
-
-static inline void carry(fe o) {
-    int i;
-
-    for (i = 0; i < 16; ++i) {
-        o[(i + 1) % 16] += (i == 15 ? 38 : 1) * (o[i] >> 16);
-        o[i] &= 0xffff;
-    }
-}
-
-static inline void cswap(fe p, fe q, int b) {
-    int i;
-    int64_t t, c = ~(b - 1);
-
-    for (i = 0; i < 16; ++i) {
-        t = c & (p[i] ^ q[i]);
-        p[i] ^= t;
-        q[i] ^= t;
-    }
-
-    memzero_explicit(&t, sizeof(t));
-    memzero_explicit(&c, sizeof(c));
-    memzero_explicit(&b, sizeof(b));
-}
-
-static inline void pack(uint8_t *o, const fe n) {
-    int i, j, b;
-    fe m, t;
-
-    memcpy(t, n, sizeof(t));
-    carry(t);
-    carry(t);
-    carry(t);
-    for (j = 0; j < 2; ++j) {
-        m[0] = t[0] - 0xffed;
-        for (i = 1; i < 15; ++i) {
-            m[i] = t[i] - 0xffff - ((m[i - 1] >> 16) & 1);
-            m[i - 1] &= 0xffff;
+        auto operator=(NetlinkSocket &&other) noexcept -> NetlinkSocket & {
+            if (this != &other) {
+                close();
+                fd_ = other.fd_;
+                addr_ = other.addr_;
+                other.fd_ = -1;
+            }
+            return *this;
         }
-        m[15] = t[15] - 0x7fff - ((m[14] >> 16) & 1);
-        b = (m[15] >> 16) & 1;
-        m[14] &= 0xffff;
-        cswap(t, m, 1 - b);
-    }
-    for (i = 0; i < 16; ++i) {
-        o[2 * i] = t[i] & 0xff;
-        o[2 * i + 1] = t[i] >> 8;
-    }
 
-    memzero_explicit(m, sizeof(m));
-    memzero_explicit(t, sizeof(t));
-    memzero_explicit(&b, sizeof(b));
-}
+        [[nodiscard]] auto is_open() const -> bool { return fd_ >= 0; }
+        [[nodiscard]] auto fd() const -> int { return fd_; }
+        [[nodiscard]] auto portid() const -> u32 { return addr_.nl_pid; }
 
-static inline void add(fe o, const fe a, const fe b) {
-    int i;
-
-    for (i = 0; i < 16; ++i)
-        o[i] = a[i] + b[i];
-}
-
-static inline void subtract(fe o, const fe a, const fe b) {
-    int i;
-
-    for (i = 0; i < 16; ++i)
-        o[i] = a[i] - b[i];
-}
-
-static inline void multmod(fe o, const fe a, const fe b) {
-    int i, j;
-    int64_t t[31] = {0};
-
-    for (i = 0; i < 16; ++i) {
-        for (j = 0; j < 16; ++j)
-            t[i + j] += a[i] * b[j];
-    }
-    for (i = 0; i < 15; ++i)
-        t[i] += 38 * t[i + 16];
-    memcpy(o, t, sizeof(fe));
-    carry(o);
-    carry(o);
-
-    memzero_explicit(t, sizeof(t));
-}
-
-static inline void invert(fe o, const fe i) {
-    fe c;
-    int a;
-
-    memcpy(c, i, sizeof(c));
-    for (a = 253; a >= 0; --a) {
-        multmod(c, c, c);
-        if (a != 2 && a != 4)
-            multmod(c, c, i);
-    }
-    memcpy(o, c, sizeof(fe));
-
-    memzero_explicit(c, sizeof(c));
-}
-
-static inline void clamp_key(uint8_t *z) {
-    z[31] = (z[31] & 127) | 64;
-    z[0] &= 248;
-}
-
-inline void wg_generate_public_key(wg_key public_key, const wg_key private_key) {
-    int i, r;
-    uint8_t z[32];
-    fe a = {1}, b = {9}, c = {0}, d = {1}, e, f;
-
-    memcpy(z, private_key, sizeof(z));
-    clamp_key(z);
-
-    for (i = 254; i >= 0; --i) {
-        r = (z[i >> 3] >> (i & 7)) & 1;
-        cswap(a, b, r);
-        cswap(c, d, r);
-        add(e, a, c);
-        subtract(a, a, c);
-        add(c, b, d);
-        subtract(b, b, d);
-        multmod(d, e, e);
-        multmod(f, a, a);
-        multmod(a, c, a);
-        multmod(c, b, e);
-        add(e, a, c);
-        subtract(a, a, c);
-        multmod(b, a, a);
-        subtract(c, d, f);
-        {
-            const fe temp = {0xdb41, 1};
-            multmod(a, c, temp);
+        [[nodiscard]] static auto open(int protocol) -> Res<NetlinkSocket> {
+            NetlinkSocket sock;
+            sock.fd_ = socket(AF_NETLINK, SOCK_RAW, protocol);
+            if (sock.fd_ < 0) {
+                return result::err(Error::io_error("Failed to open netlink socket"));
+            }
+            return result::ok(std::move(sock));
         }
-        add(a, a, d);
-        multmod(c, c, a);
-        multmod(a, d, f);
-        {
-            const fe temp = {9};
-            multmod(d, b, temp);
+
+        [[nodiscard]] auto bind(u32 groups = 0, pid_t pid = 0) -> VoidRes {
+            addr_.nl_family = AF_NETLINK;
+            addr_.nl_groups = groups;
+            addr_.nl_pid = pid;
+
+            if (::bind(fd_, reinterpret_cast<sockaddr *>(&addr_), sizeof(addr_)) < 0) {
+                return result::err(Error::io_error("Failed to bind netlink socket"));
+            }
+
+            socklen_t addr_len = sizeof(addr_);
+            if (getsockname(fd_, reinterpret_cast<sockaddr *>(&addr_), &addr_len) < 0) {
+                return result::err(Error::io_error("Failed to get socket name"));
+            }
+
+            if (addr_len != sizeof(addr_) || addr_.nl_family != AF_NETLINK) {
+                return result::err(Error::invalid_argument("Invalid socket address"));
+            }
+
+            return result::ok();
         }
-        multmod(b, e, e);
-        cswap(a, b, r);
-        cswap(c, d, r);
-    }
-    invert(c, c);
-    multmod(a, a, c);
-    pack(public_key, a);
 
-    memzero_explicit(&r, sizeof(r));
-    memzero_explicit(z, sizeof(z));
-    memzero_explicit(a, sizeof(a));
-    memzero_explicit(b, sizeof(b));
-    memzero_explicit(c, sizeof(c));
-    memzero_explicit(d, sizeof(d));
-    memzero_explicit(e, sizeof(e));
-    memzero_explicit(f, sizeof(f));
-}
+        [[nodiscard]] auto send(const void *buf, usize len) -> Res<isize> {
+            sockaddr_nl snl{};
+            snl.nl_family = AF_NETLINK;
 
-inline void wg_generate_private_key(wg_key private_key) {
-    wg_generate_preshared_key(private_key);
-    clamp_key(private_key);
-}
+            isize ret = sendto(fd_, buf, len, 0, reinterpret_cast<const sockaddr *>(&snl), sizeof(snl));
+            if (ret < 0) {
+                return result::err(Error::io_error("Failed to send netlink message"));
+            }
+            return result::ok(ret);
+        }
 
-inline void wg_generate_preshared_key(wg_key preshared_key) {
-    ssize_t ret;
-    size_t i;
-    int fd;
-#if defined(__OpenBSD__) || (defined(__APPLE__) && MAC_OS_X_VERSION_MIN_REQUIRED >= MAC_OS_X_VERSION_10_12) ||         \
-    (defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 25)))
-    if (!getentropy(preshared_key, sizeof(wg_key)))
-        return;
-#endif
-#if defined(__NR_getrandom) && defined(__linux__)
-    if (syscall(__NR_getrandom, preshared_key, sizeof(wg_key), 0) == sizeof(wg_key))
-        return;
-#endif
-    fd = open("/dev/urandom", O_RDONLY);
-    assert(fd >= 0);
-    for (i = 0; i < sizeof(wg_key); i += ret) {
-        ret = read(fd, preshared_key + i, sizeof(wg_key) - i);
-        assert(ret > 0);
-    }
-    close(fd);
-}
+        [[nodiscard]] auto recv(void *buf, usize bufsiz) -> Res<isize> {
+            sockaddr_nl addr{};
+            iovec iov{buf, bufsiz};
+            msghdr msg{};
+            msg.msg_name = &addr;
+            msg.msg_namelen = sizeof(sockaddr_nl);
+            msg.msg_iov = &iov;
+            msg.msg_iovlen = 1;
 
-#ifdef __cplusplus
-}
-#endif
+            isize ret = recvmsg(fd_, &msg, 0);
+            if (ret < 0) {
+                return result::err(Error::io_error("Failed to receive netlink message"));
+            }
 
-#endif /* WIREGUARD_HPP */
+            if (msg.msg_flags & MSG_TRUNC) {
+                return result::err(Error::out_of_range("Message truncated"));
+            }
+
+            if (msg.msg_namelen != sizeof(sockaddr_nl)) {
+                return result::err(Error::invalid_argument("Invalid message address"));
+            }
+
+            return result::ok(ret);
+        }
+
+        auto close() -> void {
+            if (fd_ >= 0) {
+                ::close(fd_);
+                fd_ = -1;
+            }
+        }
+    };
+
+    // =============================================================================
+    // Genetlink Socket (for WireGuard communication)
+    // =============================================================================
+
+    class GenetlinkSocket {
+      private:
+        NetlinkSocket nl_;
+        Vector<u8> buffer_;
+        u16 family_id_ = 0;
+        u8 version_ = 0;
+        u32 seq_ = 0;
+        u32 portid_ = 0;
+
+      public:
+        GenetlinkSocket() = default;
+
+        [[nodiscard]] auto is_open() const -> bool { return nl_.is_open(); }
+        [[nodiscard]] auto family_id() const -> u16 { return family_id_; }
+        [[nodiscard]] auto seq() const -> u32 { return seq_; }
+        [[nodiscard]] auto portid() const -> u32 { return portid_; }
+
+        [[nodiscard]] static auto open(const char *family_name, u8 version) -> Res<GenetlinkSocket> {
+            GenetlinkSocket sock;
+
+            sock.buffer_.resize(nl::ideal_socket_buffer_size());
+
+            auto nl_result = NetlinkSocket::open(NETLINK_GENERIC);
+            if (nl_result.is_err()) {
+                return result::err(nl_result.error());
+            }
+            sock.nl_ = std::move(nl_result.value());
+
+            auto bind_result = sock.nl_.bind();
+            if (bind_result.is_err()) {
+                return result::err(bind_result.error());
+            }
+
+            sock.portid_ = sock.nl_.portid();
+
+            // Request family ID
+            NetlinkMessage msg;
+            auto *nlh = msg.header();
+            nlh->nlmsg_type = GENL_ID_CTRL;
+            nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+            sock.seq_ = static_cast<u32>(time(nullptr));
+            nlh->nlmsg_seq = sock.seq_;
+
+            auto *genl = msg.put_extra_header<genlmsghdr>();
+            genl->cmd = CTRL_CMD_GETFAMILY;
+            genl->version = 1;
+
+            msg.put_attr_strz(CTRL_ATTR_FAMILY_NAME, family_name);
+
+            auto send_result = sock.nl_.send(msg.data(), msg.length());
+            if (send_result.is_err()) {
+                return result::err(send_result.error());
+            }
+
+            // Receive response
+            auto recv_result = sock.nl_.recv(sock.buffer_.data(), sock.buffer_.size());
+            if (recv_result.is_err()) {
+                return result::err(recv_result.error());
+            }
+
+            // Parse family ID from response
+            auto *resp = reinterpret_cast<nlmsghdr *>(sock.buffer_.data());
+            if (resp->nlmsg_type == NLMSG_ERROR) {
+                auto *err = reinterpret_cast<nlmsgerr *>(reinterpret_cast<char *>(resp) + nl::HDRLEN());
+                if (err->error != 0) {
+                    return result::err(Error::io_error("Failed to get family ID"));
+                }
+            }
+
+            // Find CTRL_ATTR_FAMILY_ID in attributes
+            auto *attr_start = reinterpret_cast<nlattr *>(reinterpret_cast<char *>(resp) + nl::HDRLEN() +
+                                                          nl::ALIGN(sizeof(genlmsghdr)));
+            usize remaining = resp->nlmsg_len - nl::HDRLEN() - nl::ALIGN(sizeof(genlmsghdr));
+
+            while (remaining >= sizeof(nlattr)) {
+                auto *attr = reinterpret_cast<nlattr *>(reinterpret_cast<char *>(attr_start));
+
+                if (attr->nla_len < sizeof(nlattr) || attr->nla_len > remaining) {
+                    break;
+                }
+
+                if ((attr->nla_type & NLA_TYPE_MASK) == CTRL_ATTR_FAMILY_ID) {
+                    sock.family_id_ = *reinterpret_cast<u16 *>(reinterpret_cast<char *>(attr) + nl::ATTR_HDRLEN());
+                    break;
+                }
+
+                usize advance = nl::ALIGN(attr->nla_len);
+                attr_start = reinterpret_cast<nlattr *>(reinterpret_cast<char *>(attr_start) + advance);
+                remaining -= advance;
+            }
+
+            if (sock.family_id_ == 0) {
+                return result::err(Error::not_found("WireGuard kernel module not loaded"));
+            }
+
+            sock.version_ = version;
+            return result::ok(std::move(sock));
+        }
+
+        [[nodiscard]] auto prepare_message(u8 cmd, u16 flags) -> NetlinkMessage {
+            NetlinkMessage msg;
+            auto *nlh = msg.header();
+            nlh->nlmsg_type = family_id_;
+            nlh->nlmsg_flags = flags;
+            seq_ = static_cast<u32>(time(nullptr));
+            nlh->nlmsg_seq = seq_;
+
+            auto *genl = msg.put_extra_header<genlmsghdr>();
+            genl->cmd = cmd;
+            genl->version = version_;
+
+            return msg;
+        }
+
+        [[nodiscard]] auto send(const NetlinkMessage &msg) -> VoidRes {
+            auto result = nl_.send(msg.data(), msg.length());
+            if (result.is_err()) {
+                return result::err(result.error());
+            }
+            return result::ok();
+        }
+
+        template <typename Callback> [[nodiscard]] auto recv_run(Callback &&cb) -> VoidRes {
+            while (true) {
+                auto recv_result = nl_.recv(buffer_.data(), buffer_.size());
+                if (recv_result.is_err()) {
+                    return result::err(recv_result.error());
+                }
+
+                isize len = recv_result.value();
+                if (len <= 0) {
+                    break;
+                }
+
+                auto *nlh = reinterpret_cast<nlmsghdr *>(buffer_.data());
+                while (len >= static_cast<isize>(sizeof(nlmsghdr)) && nlh->nlmsg_len >= sizeof(nlmsghdr) &&
+                       static_cast<isize>(nlh->nlmsg_len) <= len) {
+
+                    if (nlh->nlmsg_type == NLMSG_ERROR) {
+                        auto *err = reinterpret_cast<nlmsgerr *>(reinterpret_cast<char *>(nlh) + nl::HDRLEN());
+                        if (err->error < 0) {
+                            errno = -err->error;
+                            return result::err(Error::io_error("Netlink error"));
+                        }
+                        return result::ok();
+                    }
+
+                    if (nlh->nlmsg_type == NLMSG_DONE) {
+                        return result::ok();
+                    }
+
+                    // Process message with callback
+                    int cb_result = cb(nlh);
+                    if (cb_result <= 0) {
+                        if (cb_result < 0) {
+                            return result::err(Error::io_error("Callback error"));
+                        }
+                        return result::ok();
+                    }
+
+                    // Move to next message
+                    usize advance = nl::ALIGN(nlh->nlmsg_len);
+                    nlh = reinterpret_cast<nlmsghdr *>(reinterpret_cast<char *>(nlh) + advance);
+                    len -= advance;
+                }
+            }
+
+            return result::ok();
+        }
+    };
+
+    // =============================================================================
+    // Key Operations (using keylock/libsodium)
+    // =============================================================================
+
+    namespace key {
+
+        namespace detail {
+
+            // WireGuard-specific base64 encoding (constant-time)
+            inline auto encode_base64(char dest[4], const u8 src[3]) -> void {
+                const u8 input[] = {
+                    static_cast<u8>((src[0] >> 2) & 63), static_cast<u8>(((src[0] << 4) | (src[1] >> 4)) & 63),
+                    static_cast<u8>(((src[1] << 2) | (src[2] >> 6)) & 63), static_cast<u8>(src[2] & 63)};
+
+                for (u32 i = 0; i < 4; ++i) {
+                    dest[i] = static_cast<char>(input[i] + 'A' + (((25 - input[i]) >> 8) & 6) -
+                                                (((51 - input[i]) >> 8) & 75) - (((61 - input[i]) >> 8) & 15) +
+                                                (((62 - input[i]) >> 8) & 3));
+                }
+            }
+
+            // WireGuard-specific base64 decoding (constant-time)
+            inline auto decode_base64(const char src[4]) -> int {
+                int val = 0;
+                for (u32 i = 0; i < 4; ++i) {
+                    val |= (-1 + ((((('A' - 1) - src[i]) & (src[i] - ('Z' + 1))) >> 8) & (src[i] - 64)) +
+                            ((((('a' - 1) - src[i]) & (src[i] - ('z' + 1))) >> 8) & (src[i] - 70)) +
+                            ((((('0' - 1) - src[i]) & (src[i] - ('9' + 1))) >> 8) & (src[i] + 5)) +
+                            ((((('+' - 1) - src[i]) & (src[i] - ('+' + 1))) >> 8) & 63) +
+                            ((((('/' - 1) - src[i]) & (src[i] - ('/' + 1))) >> 8) & 64))
+                           << (18 - 6 * i);
+                }
+                return val;
+            }
+
+        } // namespace detail
+
+        // Convert key to WireGuard base64 format
+        inline auto to_base64(KeyB64 &base64, const Key &key) -> void {
+            for (u32 i = 0; i < 32 / 3; ++i) {
+                detail::encode_base64(&base64.data[i * 4], &key.data[i * 3]);
+            }
+            const u8 temp[3] = {key.data[10 * 3 + 0], key.data[10 * 3 + 1], 0};
+            detail::encode_base64(&base64.data[10 * 4], temp);
+            base64.data[KEY_B64_SIZE - 2] = '=';
+            base64.data[KEY_B64_SIZE - 1] = '\0';
+        }
+
+        // Parse key from WireGuard base64 format
+        inline auto from_base64(Key &key, const KeyB64 &base64) -> Res<void> {
+            if (std::strlen(base64.c_str()) != KEY_B64_SIZE - 1 || base64.data[KEY_B64_SIZE - 2] != '=') {
+                return result::err(Error::invalid_argument("Invalid base64 key"));
+            }
+
+            volatile u8 ret = 0;
+            for (u32 i = 0; i < 32 / 3; ++i) {
+                int val = detail::decode_base64(&base64.data[i * 4]);
+                ret |= static_cast<u32>(val) >> 31;
+                key.data[i * 3 + 0] = (val >> 16) & 0xff;
+                key.data[i * 3 + 1] = (val >> 8) & 0xff;
+                key.data[i * 3 + 2] = val & 0xff;
+            }
+
+            const char temp[4] = {base64.data[10 * 4 + 0], base64.data[10 * 4 + 1], base64.data[10 * 4 + 2], 'A'};
+            int val = detail::decode_base64(temp);
+            ret |= (static_cast<u32>(val) >> 31) | (val & 0xff);
+            key.data[10 * 3 + 0] = (val >> 16) & 0xff;
+            key.data[10 * 3 + 1] = (val >> 8) & 0xff;
+
+            if (ret != 0) {
+                return result::err(Error::invalid_argument("Invalid base64 encoding"));
+            }
+
+            return result::ok();
+        }
+
+        // Generate random preshared key using keylock (libsodium)
+        inline auto generate_preshared(Key &key) -> void {
+            auto random_bytes = keylock::utils::Common::generate_random_bytes(KEY_SIZE);
+            std::memcpy(key.raw(), random_bytes.data(), KEY_SIZE);
+            keylock::utils::Common::secure_clear(random_bytes.data(), random_bytes.size());
+        }
+
+        // Generate Curve25519 private key using keylock (libsodium)
+        inline auto generate_private(Key &private_key) -> void {
+            // Use libsodium's secure random generation via keylock
+            auto random_bytes = keylock::utils::Common::generate_random_bytes(KEY_SIZE);
+            std::memcpy(private_key.raw(), random_bytes.data(), KEY_SIZE);
+            keylock::utils::Common::secure_clear(random_bytes.data(), random_bytes.size());
+
+            // Clamp for Curve25519 (WireGuard format)
+            private_key.data[0] &= 248;
+            private_key.data[31] = (private_key.data[31] & 127) | 64;
+        }
+
+        // Derive Curve25519 public key from private key using libsodium
+        inline auto generate_public(Key &public_key, const Key &private_key) -> void {
+            // Use libsodium's crypto_scalarmult_base for Curve25519 point multiplication
+            // This computes public_key = private_key * G where G is the base point
+            crypto_scalarmult_base(public_key.raw(), private_key.raw());
+        }
+
+        // Generate a complete WireGuard keypair using keylock
+        inline auto generate_keypair() -> Pair<Key, Key> {
+            Key private_key, public_key;
+            generate_private(private_key);
+            generate_public(public_key, private_key);
+            return {private_key, public_key};
+        }
+
+        // Generate keypair using keylock's X25519 context
+        inline auto generate_keypair_x25519() -> Pair<Key, Key> {
+            keylock::crypto::Context ctx(keylock::crypto::Context::Algorithm::X25519_Box);
+            auto keypair = ctx.generate_keypair();
+
+            Key private_key, public_key;
+
+            // Copy public key (32 bytes)
+            std::memcpy(public_key.raw(), keypair.public_key.data(),
+                        std::min(keypair.public_key.size(), static_cast<usize>(KEY_SIZE)));
+
+            // For X25519, private key in keylock is 64 bytes (pub + secret)
+            // WireGuard uses just the 32-byte secret portion
+            if (keypair.private_key.size() >= KEY_SIZE) {
+                // The secret key is the first 32 bytes in libsodium's format
+                std::memcpy(private_key.raw(), keypair.private_key.data(), KEY_SIZE);
+            }
+
+            // Secure clear the original keypair
+            keylock::utils::Common::secure_clear(keypair.private_key.data(), keypair.private_key.size());
+            keylock::utils::Common::secure_clear(keypair.public_key.data(), keypair.public_key.size());
+
+            return {private_key, public_key};
+        }
+
+        // Convert Key to keylock vector format
+        inline auto to_vector(const Key &key) -> std::vector<u8> {
+            return std::vector<u8>(key.data.begin(), key.data.end());
+        }
+
+        // Convert keylock vector to Key
+        inline auto from_vector(Key &key, const std::vector<u8> &vec) -> bool {
+            if (vec.size() < KEY_SIZE)
+                return false;
+            std::memcpy(key.raw(), vec.data(), KEY_SIZE);
+            return true;
+        }
+
+        // Get keylock crypto context for advanced operations
+        inline auto get_context() -> keylock::crypto::Context {
+            return keylock::crypto::Context(keylock::crypto::Context::Algorithm::X25519_Box);
+        }
+
+    } // namespace key
+
+    // =============================================================================
+    // Device Management API
+    // =============================================================================
+
+    namespace api {
+
+        namespace detail {
+
+            inline auto add_del_iface(const char *ifname, bool add) -> VoidRes {
+                auto nl_result = NetlinkSocket::open(NETLINK_ROUTE);
+                if (nl_result.is_err()) {
+                    return result::err(nl_result.error());
+                }
+                auto nl = std::move(nl_result.value());
+
+                auto bind_result = nl.bind();
+                if (bind_result.is_err()) {
+                    return result::err(bind_result.error());
+                }
+
+                NetlinkMessage msg;
+                auto *nlh = msg.header();
+                nlh->nlmsg_type = add ? RTM_NEWLINK : RTM_DELLINK;
+                nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | (add ? NLM_F_CREATE | NLM_F_EXCL : 0);
+                nlh->nlmsg_seq = static_cast<u32>(time(nullptr));
+
+                auto *ifm = msg.put_extra_header<ifinfomsg>();
+                ifm->ifi_family = AF_UNSPEC;
+
+                msg.put_attr_strz(IFLA_IFNAME, ifname);
+
+                auto *nest = msg.nest_start(IFLA_LINKINFO);
+                msg.put_attr_strz(IFLA_INFO_KIND, GENL_NAME);
+                msg.nest_end(nest);
+
+                auto send_result = nl.send(msg.data(), msg.length());
+                if (send_result.is_err()) {
+                    return result::err(send_result.error());
+                }
+
+                Vector<u8> buffer(nl::ideal_socket_buffer_size());
+                auto recv_result = nl.recv(buffer.data(), buffer.size());
+                if (recv_result.is_err()) {
+                    return result::err(recv_result.error());
+                }
+
+                auto *resp = reinterpret_cast<nlmsghdr *>(buffer.data());
+                if (resp->nlmsg_type == NLMSG_ERROR) {
+                    auto *err = reinterpret_cast<nlmsgerr *>(reinterpret_cast<char *>(resp) + nl::HDRLEN());
+                    if (err->error != 0) {
+                        errno = -err->error;
+                        return result::err(Error::io_error("Failed to create/delete interface"));
+                    }
+                }
+
+                return result::ok();
+            }
+
+        } // namespace detail
+
+        [[nodiscard]] inline auto add_device(const char *device_name) -> VoidRes {
+            return detail::add_del_iface(device_name, true);
+        }
+
+        [[nodiscard]] inline auto del_device(const char *device_name) -> VoidRes {
+            return detail::add_del_iface(device_name, false);
+        }
+
+        [[nodiscard]] inline auto list_device_names() -> Res<Vector<String>> {
+            auto nl_result = NetlinkSocket::open(NETLINK_ROUTE);
+            if (nl_result.is_err()) {
+                return result::err(nl_result.error());
+            }
+            auto nl = std::move(nl_result.value());
+
+            auto bind_result = nl.bind();
+            if (bind_result.is_err()) {
+                return result::err(bind_result.error());
+            }
+
+            NetlinkMessage msg;
+            auto *nlh = msg.header();
+            nlh->nlmsg_type = RTM_GETLINK;
+            nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_DUMP;
+            nlh->nlmsg_seq = static_cast<u32>(time(nullptr));
+
+            auto *ifm = msg.put_extra_header<ifinfomsg>();
+            ifm->ifi_family = AF_UNSPEC;
+
+            auto send_result = nl.send(msg.data(), msg.length());
+            if (send_result.is_err()) {
+                return result::err(send_result.error());
+            }
+
+            Vector<String> devices;
+            Vector<u8> buffer(nl::ideal_socket_buffer_size());
+            u32 seq = nlh->nlmsg_seq;
+            u32 portid = nl.portid();
+
+            while (true) {
+                auto recv_result = nl.recv(buffer.data(), buffer.size());
+                if (recv_result.is_err()) {
+                    return result::err(recv_result.error());
+                }
+
+                isize len = recv_result.value();
+                if (len <= 0)
+                    break;
+
+                auto *resp = reinterpret_cast<nlmsghdr *>(buffer.data());
+                bool done = false;
+
+                while (len >= static_cast<isize>(sizeof(nlmsghdr)) && resp->nlmsg_len >= sizeof(nlmsghdr) &&
+                       static_cast<isize>(resp->nlmsg_len) <= len) {
+
+                    if (resp->nlmsg_type == NLMSG_DONE) {
+                        done = true;
+                        break;
+                    }
+
+                    if (resp->nlmsg_type == NLMSG_ERROR) {
+                        auto *err = reinterpret_cast<nlmsgerr *>(reinterpret_cast<char *>(resp) + nl::HDRLEN());
+                        if (err->error != 0) {
+                            return result::err(Error::io_error("Netlink error"));
+                        }
+                        done = true;
+                        break;
+                    }
+
+                    // Parse interface info
+                    const char *if_name = nullptr;
+                    bool is_wireguard = false;
+
+                    auto *attr_start = reinterpret_cast<nlattr *>(reinterpret_cast<char *>(resp) + nl::HDRLEN() +
+                                                                  nl::ALIGN(sizeof(ifinfomsg)));
+                    usize remaining = resp->nlmsg_len - nl::HDRLEN() - nl::ALIGN(sizeof(ifinfomsg));
+
+                    while (remaining >= sizeof(nlattr)) {
+                        auto *attr = attr_start;
+                        if (attr->nla_len < sizeof(nlattr) || attr->nla_len > remaining)
+                            break;
+
+                        u16 type = attr->nla_type & NLA_TYPE_MASK;
+
+                        if (type == IFLA_IFNAME) {
+                            if_name = reinterpret_cast<const char *>(attr) + nl::ATTR_HDRLEN();
+                        } else if (type == IFLA_LINKINFO) {
+                            // Parse nested LINKINFO
+                            auto *nested =
+                                reinterpret_cast<nlattr *>(reinterpret_cast<char *>(attr) + nl::ATTR_HDRLEN());
+                            usize nested_remaining = attr->nla_len - nl::ATTR_HDRLEN();
+
+                            while (nested_remaining >= sizeof(nlattr)) {
+                                if (nested->nla_len < sizeof(nlattr) || nested->nla_len > nested_remaining)
+                                    break;
+
+                                u16 nested_type = nested->nla_type & NLA_TYPE_MASK;
+                                if (nested_type == IFLA_INFO_KIND) {
+                                    const char *kind = reinterpret_cast<const char *>(nested) + nl::ATTR_HDRLEN();
+                                    if (std::strcmp(kind, GENL_NAME) == 0) {
+                                        is_wireguard = true;
+                                    }
+                                }
+
+                                usize advance = nl::ALIGN(nested->nla_len);
+                                nested = reinterpret_cast<nlattr *>(reinterpret_cast<char *>(nested) + advance);
+                                nested_remaining -= advance;
+                            }
+                        }
+
+                        usize advance = nl::ALIGN(attr->nla_len);
+                        attr_start = reinterpret_cast<nlattr *>(reinterpret_cast<char *>(attr_start) + advance);
+                        remaining -= advance;
+                    }
+
+                    if (if_name && is_wireguard) {
+                        devices.push_back(String(if_name));
+                    }
+
+                    usize advance = nl::ALIGN(resp->nlmsg_len);
+                    resp = reinterpret_cast<nlmsghdr *>(reinterpret_cast<char *>(resp) + advance);
+                    len -= advance;
+                }
+
+                if (done)
+                    break;
+            }
+
+            return result::ok(std::move(devices));
+        }
+
+        [[nodiscard]] inline auto get_device(const char *device_name) -> Res<Device> {
+            auto nlg_result = GenetlinkSocket::open(GENL_NAME, GENL_VERSION);
+            if (nlg_result.is_err()) {
+                return result::err(nlg_result.error());
+            }
+            auto nlg = std::move(nlg_result.value());
+
+            auto msg = nlg.prepare_message(static_cast<u8>(WgCmd::GetDevice), NLM_F_REQUEST | NLM_F_ACK | NLM_F_DUMP);
+            msg.put_attr_strz(static_cast<u16>(WgDeviceAttr::Ifname), device_name);
+
+            auto send_result = nlg.send(msg);
+            if (send_result.is_err()) {
+                return result::err(send_result.error());
+            }
+
+            Device device(device_name);
+            Peer *current_peer = nullptr;
+
+            auto recv_result = nlg.recv_run([&](const nlmsghdr *nlh) -> int {
+                // Parse device attributes
+                auto *attr_start = reinterpret_cast<const nlattr *>(reinterpret_cast<const char *>(nlh) + nl::HDRLEN() +
+                                                                    nl::ALIGN(sizeof(genlmsghdr)));
+                usize remaining = nlh->nlmsg_len - nl::HDRLEN() - nl::ALIGN(sizeof(genlmsghdr));
+
+                while (remaining >= sizeof(nlattr)) {
+                    auto *attr = attr_start;
+                    if (attr->nla_len < sizeof(nlattr) || attr->nla_len > remaining)
+                        break;
+
+                    u16 type = attr->nla_type & NLA_TYPE_MASK;
+                    const void *payload = reinterpret_cast<const char *>(attr) + nl::ATTR_HDRLEN();
+                    usize payload_len = attr->nla_len - nl::ATTR_HDRLEN();
+
+                    switch (static_cast<WgDeviceAttr>(type)) {
+                    case WgDeviceAttr::Ifindex:
+                        if (payload_len >= sizeof(u32)) {
+                            device.ifindex = *reinterpret_cast<const u32 *>(payload);
+                        }
+                        break;
+                    case WgDeviceAttr::Ifname:
+                        std::strncpy(device.name.data(), reinterpret_cast<const char *>(payload), IFNAMSIZ - 1);
+                        break;
+                    case WgDeviceAttr::PrivateKey:
+                        if (payload_len == KEY_SIZE) {
+                            std::memcpy(device.private_key.raw(), payload, KEY_SIZE);
+                            device.flags |= DeviceFlags::HasPrivateKey;
+                        }
+                        break;
+                    case WgDeviceAttr::PublicKey:
+                        if (payload_len == KEY_SIZE) {
+                            std::memcpy(device.public_key.raw(), payload, KEY_SIZE);
+                            device.flags |= DeviceFlags::HasPublicKey;
+                        }
+                        break;
+                    case WgDeviceAttr::ListenPort:
+                        if (payload_len >= sizeof(u16)) {
+                            device.listen_port = *reinterpret_cast<const u16 *>(payload);
+                            device.flags |= DeviceFlags::HasListenPort;
+                        }
+                        break;
+                    case WgDeviceAttr::Fwmark:
+                        if (payload_len >= sizeof(u32)) {
+                            device.fwmark = *reinterpret_cast<const u32 *>(payload);
+                            device.flags |= DeviceFlags::HasFwmark;
+                        }
+                        break;
+                    case WgDeviceAttr::Peers: {
+                        // Parse nested peers
+                        auto *peer_attr = reinterpret_cast<const nlattr *>(payload);
+                        usize peer_remaining = payload_len;
+
+                        while (peer_remaining >= sizeof(nlattr)) {
+                            if (peer_attr->nla_len < sizeof(nlattr) || peer_attr->nla_len > peer_remaining)
+                                break;
+
+                            Peer peer;
+
+                            // Parse single peer
+                            auto *inner = reinterpret_cast<const nlattr *>(reinterpret_cast<const char *>(peer_attr) +
+                                                                           nl::ATTR_HDRLEN());
+                            usize inner_remaining = peer_attr->nla_len - nl::ATTR_HDRLEN();
+
+                            while (inner_remaining >= sizeof(nlattr)) {
+                                if (inner->nla_len < sizeof(nlattr) || inner->nla_len > inner_remaining)
+                                    break;
+
+                                u16 inner_type = inner->nla_type & NLA_TYPE_MASK;
+                                const void *inner_payload = reinterpret_cast<const char *>(inner) + nl::ATTR_HDRLEN();
+                                usize inner_payload_len = inner->nla_len - nl::ATTR_HDRLEN();
+
+                                switch (static_cast<WgPeerAttr>(inner_type)) {
+                                case WgPeerAttr::PublicKey:
+                                    if (inner_payload_len == KEY_SIZE) {
+                                        std::memcpy(peer.public_key.raw(), inner_payload, KEY_SIZE);
+                                        peer.flags |= PeerFlags::HasPublicKey;
+                                    }
+                                    break;
+                                case WgPeerAttr::PresharedKey:
+                                    if (inner_payload_len == KEY_SIZE) {
+                                        std::memcpy(peer.preshared_key.raw(), inner_payload, KEY_SIZE);
+                                        if (!peer.preshared_key.is_zero()) {
+                                            peer.flags |= PeerFlags::HasPresharedKey;
+                                        }
+                                    }
+                                    break;
+                                case WgPeerAttr::Endpoint:
+                                    if (inner_payload_len >= sizeof(sockaddr)) {
+                                        auto *sa = reinterpret_cast<const sockaddr *>(inner_payload);
+                                        if (sa->sa_family == AF_INET && inner_payload_len >= sizeof(sockaddr_in)) {
+                                            std::memcpy(&peer.endpoint.addr4, inner_payload, sizeof(sockaddr_in));
+                                        } else if (sa->sa_family == AF_INET6 &&
+                                                   inner_payload_len >= sizeof(sockaddr_in6)) {
+                                            std::memcpy(&peer.endpoint.addr6, inner_payload, sizeof(sockaddr_in6));
+                                        }
+                                    }
+                                    break;
+                                case WgPeerAttr::PersistentKeepaliveInterval:
+                                    if (inner_payload_len >= sizeof(u16)) {
+                                        peer.persistent_keepalive_interval =
+                                            *reinterpret_cast<const u16 *>(inner_payload);
+                                        peer.flags |= PeerFlags::HasPersistentKeepaliveInterval;
+                                    }
+                                    break;
+                                case WgPeerAttr::LastHandshakeTime:
+                                    if (inner_payload_len >= sizeof(Timespec64)) {
+                                        std::memcpy(&peer.last_handshake_time, inner_payload, sizeof(Timespec64));
+                                    }
+                                    break;
+                                case WgPeerAttr::RxBytes:
+                                    if (inner_payload_len >= sizeof(u64)) {
+                                        peer.rx_bytes = *reinterpret_cast<const u64 *>(inner_payload);
+                                    }
+                                    break;
+                                case WgPeerAttr::TxBytes:
+                                    if (inner_payload_len >= sizeof(u64)) {
+                                        peer.tx_bytes = *reinterpret_cast<const u64 *>(inner_payload);
+                                    }
+                                    break;
+                                case WgPeerAttr::AllowedIps: {
+                                    // Parse allowed IPs
+                                    auto *ip_attr = reinterpret_cast<const nlattr *>(inner_payload);
+                                    usize ip_remaining = inner_payload_len;
+
+                                    while (ip_remaining >= sizeof(nlattr)) {
+                                        if (ip_attr->nla_len < sizeof(nlattr) || ip_attr->nla_len > ip_remaining)
+                                            break;
+
+                                        AllowedIp allowed_ip;
+
+                                        auto *ip_inner = reinterpret_cast<const nlattr *>(
+                                            reinterpret_cast<const char *>(ip_attr) + nl::ATTR_HDRLEN());
+                                        usize ip_inner_remaining = ip_attr->nla_len - nl::ATTR_HDRLEN();
+
+                                        while (ip_inner_remaining >= sizeof(nlattr)) {
+                                            if (ip_inner->nla_len < sizeof(nlattr) ||
+                                                ip_inner->nla_len > ip_inner_remaining)
+                                                break;
+
+                                            u16 ip_type = ip_inner->nla_type & NLA_TYPE_MASK;
+                                            const void *ip_payload =
+                                                reinterpret_cast<const char *>(ip_inner) + nl::ATTR_HDRLEN();
+                                            usize ip_payload_len = ip_inner->nla_len - nl::ATTR_HDRLEN();
+
+                                            switch (static_cast<WgAllowedIpAttr>(ip_type)) {
+                                            case WgAllowedIpAttr::Family:
+                                                if (ip_payload_len >= sizeof(u16)) {
+                                                    allowed_ip.family = *reinterpret_cast<const u16 *>(ip_payload);
+                                                }
+                                                break;
+                                            case WgAllowedIpAttr::IpAddr:
+                                                if (ip_payload_len == sizeof(in_addr)) {
+                                                    std::memcpy(&allowed_ip.ip4, ip_payload, sizeof(in_addr));
+                                                } else if (ip_payload_len == sizeof(in6_addr)) {
+                                                    std::memcpy(&allowed_ip.ip6, ip_payload, sizeof(in6_addr));
+                                                }
+                                                break;
+                                            case WgAllowedIpAttr::CidrMask:
+                                                if (ip_payload_len >= sizeof(u8)) {
+                                                    allowed_ip.cidr = *reinterpret_cast<const u8 *>(ip_payload);
+                                                }
+                                                break;
+                                            default:
+                                                break;
+                                            }
+
+                                            usize ip_advance = nl::ALIGN(ip_inner->nla_len);
+                                            ip_inner = reinterpret_cast<const nlattr *>(
+                                                reinterpret_cast<const char *>(ip_inner) + ip_advance);
+                                            ip_inner_remaining -= ip_advance;
+                                        }
+
+                                        if (allowed_ip.is_valid()) {
+                                            peer.allowed_ips.push_back(allowed_ip);
+                                        }
+
+                                        usize ip_advance = nl::ALIGN(ip_attr->nla_len);
+                                        ip_attr = reinterpret_cast<const nlattr *>(
+                                            reinterpret_cast<const char *>(ip_attr) + ip_advance);
+                                        ip_remaining -= ip_advance;
+                                    }
+                                    break;
+                                }
+                                default:
+                                    break;
+                                }
+
+                                usize inner_advance = nl::ALIGN(inner->nla_len);
+                                inner = reinterpret_cast<const nlattr *>(reinterpret_cast<const char *>(inner) +
+                                                                         inner_advance);
+                                inner_remaining -= inner_advance;
+                            }
+
+                            if (has_flag(peer.flags, PeerFlags::HasPublicKey)) {
+                                device.peers.push_back(std::move(peer));
+                            }
+
+                            usize peer_advance = nl::ALIGN(peer_attr->nla_len);
+                            peer_attr = reinterpret_cast<const nlattr *>(reinterpret_cast<const char *>(peer_attr) +
+                                                                         peer_advance);
+                            peer_remaining -= peer_advance;
+                        }
+                        break;
+                    }
+                    default:
+                        break;
+                    }
+
+                    usize advance = nl::ALIGN(attr->nla_len);
+                    attr_start = reinterpret_cast<const nlattr *>(reinterpret_cast<const char *>(attr_start) + advance);
+                    remaining -= advance;
+                }
+
+                return 1; // Continue processing
+            });
+
+            if (recv_result.is_err()) {
+                return result::err(recv_result.error());
+            }
+
+            return result::ok(std::move(device));
+        }
+
+        [[nodiscard]] inline auto set_device(const Device &device) -> VoidRes {
+            auto nlg_result = GenetlinkSocket::open(GENL_NAME, GENL_VERSION);
+            if (nlg_result.is_err()) {
+                return result::err(nlg_result.error());
+            }
+            auto nlg = std::move(nlg_result.value());
+
+            auto msg = nlg.prepare_message(static_cast<u8>(WgCmd::SetDevice), NLM_F_REQUEST | NLM_F_ACK);
+
+            msg.put_attr_strz(static_cast<u16>(WgDeviceAttr::Ifname), device.get_name());
+
+            // Device attributes
+            if (device.has_private_key()) {
+                msg.put_attr(static_cast<u16>(WgDeviceAttr::PrivateKey), device.private_key.raw(), KEY_SIZE);
+            }
+
+            if (device.has_listen_port()) {
+                msg.put_attr_u16(static_cast<u16>(WgDeviceAttr::ListenPort), device.listen_port);
+            }
+
+            if (device.has_fwmark()) {
+                msg.put_attr_u32(static_cast<u16>(WgDeviceAttr::Fwmark), device.fwmark);
+            }
+
+            u32 dev_flags = 0;
+            if (device.should_replace_peers()) {
+                dev_flags |= 1U << 0; // WGDEVICE_F_REPLACE_PEERS
+            }
+            if (dev_flags != 0) {
+                msg.put_attr_u32(static_cast<u16>(WgDeviceAttr::Flags), dev_flags);
+            }
+
+            // Add peers
+            if (!device.peers.empty()) {
+                auto *peers_nest = msg.nest_start(static_cast<u16>(WgDeviceAttr::Peers));
+                if (!peers_nest) {
+                    return result::err(Error::out_of_range("Message buffer too small"));
+                }
+
+                for (const auto &peer : device.peers) {
+                    auto *peer_nest = msg.nest_start(0);
+                    if (!peer_nest) {
+                        msg.nest_end(peers_nest);
+                        break;
+                    }
+
+                    // Public key (required)
+                    if (!msg.put_attr(static_cast<u16>(WgPeerAttr::PublicKey), peer.public_key.raw(), KEY_SIZE)) {
+                        msg.nest_cancel(peer_nest);
+                        msg.nest_end(peers_nest);
+                        break;
+                    }
+
+                    // Peer flags
+                    u32 peer_flags = 0;
+                    if (peer.should_remove()) {
+                        peer_flags |= 1U << 0; // WGPEER_F_REMOVE_ME
+                    }
+                    if (peer.should_replace_allowed_ips()) {
+                        peer_flags |= 1U << 1; // WGPEER_F_REPLACE_ALLOWEDIPS
+                    }
+                    if (peer_flags != 0) {
+                        msg.put_attr_u32(static_cast<u16>(WgPeerAttr::Flags), peer_flags);
+                    }
+
+                    // Preshared key
+                    if (peer.has_preshared_key()) {
+                        msg.put_attr(static_cast<u16>(WgPeerAttr::PresharedKey), peer.preshared_key.raw(), KEY_SIZE);
+                    }
+
+                    // Endpoint
+                    if (peer.endpoint.is_ipv4()) {
+                        msg.put_attr(static_cast<u16>(WgPeerAttr::Endpoint), &peer.endpoint.addr4, sizeof(sockaddr_in));
+                    } else if (peer.endpoint.is_ipv6()) {
+                        msg.put_attr(static_cast<u16>(WgPeerAttr::Endpoint), &peer.endpoint.addr6,
+                                     sizeof(sockaddr_in6));
+                    }
+
+                    // Persistent keepalive
+                    if (has_flag(peer.flags, PeerFlags::HasPersistentKeepaliveInterval)) {
+                        msg.put_attr_u16(static_cast<u16>(WgPeerAttr::PersistentKeepaliveInterval),
+                                         peer.persistent_keepalive_interval);
+                    }
+
+                    // Allowed IPs
+                    if (!peer.allowed_ips.empty()) {
+                        auto *ips_nest = msg.nest_start(static_cast<u16>(WgPeerAttr::AllowedIps));
+                        if (ips_nest) {
+                            for (const auto &ip : peer.allowed_ips) {
+                                auto *ip_nest = msg.nest_start(0);
+                                if (!ip_nest)
+                                    break;
+
+                                msg.put_attr_u16(static_cast<u16>(WgAllowedIpAttr::Family), ip.family);
+
+                                if (ip.is_ipv4()) {
+                                    msg.put_attr(static_cast<u16>(WgAllowedIpAttr::IpAddr), &ip.ip4, sizeof(in_addr));
+                                } else if (ip.is_ipv6()) {
+                                    msg.put_attr(static_cast<u16>(WgAllowedIpAttr::IpAddr), &ip.ip6, sizeof(in6_addr));
+                                }
+
+                                msg.put_attr_u8(static_cast<u16>(WgAllowedIpAttr::CidrMask), ip.cidr);
+
+                                msg.nest_end(ip_nest);
+                            }
+                            msg.nest_end(ips_nest);
+                        }
+                    }
+
+                    msg.nest_end(peer_nest);
+                }
+
+                msg.nest_end(peers_nest);
+            }
+
+            auto send_result = nlg.send(msg);
+            if (send_result.is_err()) {
+                return result::err(send_result.error());
+            }
+
+            auto recv_result = nlg.recv_run([](const nlmsghdr *) { return 1; });
+            if (recv_result.is_err()) {
+                return result::err(recv_result.error());
+            }
+
+            return result::ok();
+        }
+
+    } // namespace api
+
+    // =============================================================================
+    // Convenience Type Aliases
+    // =============================================================================
+
+    using WgKey = Key;
+    using WgKeyB64 = KeyB64;
+    using WgAllowedIp = AllowedIp;
+    using WgEndpoint = Endpoint;
+    using WgPeer = Peer;
+    using WgDevice = Device;
+
+} // namespace wg
+
+#endif // WIREGUARD_HPP
