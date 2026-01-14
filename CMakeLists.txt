@@ -12,9 +12,10 @@ set(PROJECT_VERSION "0.0.1")
 #   Pkg:    set(LIB_DEPS "pkg::name" ...)  # Uses pkg-config
 set(LIB_DEPS
     "echo|https://github.com/bresilla/echo.git|0.0.23"
-    "echo|https://github.com/bresilla/scan.git|0.0.2"
+    "scan|https://github.com/bresilla/scan.git|0.0.2"
     "datapod|https://github.com/robolibs/datapod.git|0.0.36"
     "wirebit|https://github.com/robolibs/wirebit.git|0.0.10"
+    "netpipe|https://github.com/robolibs/netpipe.git|0.0.7"
     "keylock|https://github.com/robolibs/keylock.git|0.0.4"
     "blockit|https://github.com/robolibs/blockit.git|0.0.6"
     "pkg::libsodium"
