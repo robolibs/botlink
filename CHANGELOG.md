@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.4] - 2026-01-15
+
+### <!-- 0 -->⛰️  Features
+
+- Enhance identity management and network control
+- Implement trust chain synchronization and rekey
+
 ## [0.0.3] - 2026-01-15
 
 ### <!-- 3 -->📚 Documentation

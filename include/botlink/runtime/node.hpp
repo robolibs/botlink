@@ -553,9 +553,25 @@ namespace botlink {
                 if (route_table_.has_value()) {
                     auto route = route_table_->lookup_packet(pkt.data);
                     if (route.has_value()) {
-                        // Send to peer via data plane
-                        // TODO: Implement
-                        echo::debug("BotlinkNode: Would send packet to peer");
+                        // Get peer for next hop
+                        if (peer_table_.has_value()) {
+                            auto peer = peer_table_->get_peer(route->next_hop);
+                            if (peer.has_value() && (*peer)->has_session()) {
+                                // Send encrypted data via data plane
+                                if (data_plane_ != nullptr) {
+                                    auto res = data_plane_->send_data(route->next_hop, pkt.data);
+                                    if (res.is_ok()) {
+                                        stats_.packets_sent++;
+                                        stats_.bytes_sent += pkt.data.size();
+                                    } else {
+                                        echo::warn("BotlinkNode: Failed to forward packet: ",
+                                                   res.error().message.c_str());
+                                    }
+                                }
+                            } else {
+                                echo::debug("BotlinkNode: No session for next hop, dropping packet");
+                            }
+                        }
                     }
                 }
             }
@@ -583,8 +599,23 @@ namespace botlink {
             }
 
             auto sync_trust() -> void {
-                // TODO: Sync trust chain with peers
-                echo::debug("BotlinkNode: Trust sync tick");
+                // Request chain sync from connected peers
+                if (!peer_table_.has_value() || control_plane_ == nullptr) {
+                    return;
+                }
+
+                // Get connected peers and request sync from first available
+                auto connected = peer_table_->get_connected_peers();
+                for (auto *peer : connected) {
+                    auto ep = peer->preferred_endpoint();
+                    if (ep.has_value()) {
+                        auto res = control_plane_->send_chain_sync_request(ep.value());
+                        if (res.is_ok()) {
+                            echo::debug("BotlinkNode: Requested chain sync from peer");
+                            break; // Only need to sync from one peer
+                        }
+                    }
+                }
             }
 
             auto process_vote_timeouts() -> void {

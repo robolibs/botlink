@@ -36,6 +36,8 @@ namespace botlink {
             MembershipUpdate = 0x04,
             EndpointAdvert = 0x05,
             MembershipSnapshot = 0x06,
+            ChainSyncRequest = 0x07,
+            ChainSyncResponse = 0x08,
         };
 
         // =============================================================================
@@ -97,6 +99,33 @@ namespace botlink {
         };
 
         // =============================================================================
+        // Chain Sync Request/Response - Synchronize trust chain with peers
+        // =============================================================================
+
+        struct ChainSyncRequest {
+            NodeId requester_id;
+            u64 known_height = 0; // Height of local chain
+            u64 timestamp_ms = 0;
+
+            ChainSyncRequest() = default;
+
+            auto members() noexcept { return std::tie(requester_id, known_height, timestamp_ms); }
+            auto members() const noexcept { return std::tie(requester_id, known_height, timestamp_ms); }
+        };
+
+        struct ChainSyncResponse {
+            u64 chain_height = 0;      // Total chain height
+            u64 start_height = 0;      // Height of first event in this response
+            Vector<TrustEvent> events; // Events from start_height onwards
+            u64 timestamp_ms = 0;
+
+            ChainSyncResponse() = default;
+
+            auto members() noexcept { return std::tie(chain_height, start_height, events, timestamp_ms); }
+            auto members() const noexcept { return std::tie(chain_height, start_height, events, timestamp_ms); }
+        };
+
+        // =============================================================================
         // Control Plane Handler
         // =============================================================================
 
@@ -118,6 +147,10 @@ namespace botlink {
             // Envelope validation
             u64 max_envelope_age_ms_ = 60000; // 60 seconds max age for control messages
 
+            // Endpoint advertisement cache - stores peer endpoint advertisements for address refresh
+            Map<NodeId, EndpointAdvert> endpoint_cache_;
+            u64 endpoint_cache_ttl_ms_ = 300000; // 5 minutes TTL for cached endpoints
+
           public:
             ControlPlane(const NodeId &local_id, const PrivateKey &ed25519_priv, const PublicKey &ed25519_pub,
                          TrustView *trust_view, TrustChain *trust_chain, Sponsor *sponsor, VotingManager *voting,
@@ -132,6 +165,51 @@ namespace botlink {
 
             auto set_rate_limit_ms(u64 ms) -> void { rate_limit_ms_ = ms; }
             auto set_max_envelope_age_ms(u64 ms) -> void { max_envelope_age_ms_ = ms; }
+            auto set_endpoint_cache_ttl_ms(u64 ms) -> void { endpoint_cache_ttl_ms_ = ms; }
+
+            // =============================================================================
+            // Endpoint Cache Access
+            // =============================================================================
+
+            // Get cached endpoint advertisement for a peer
+            [[nodiscard]] auto get_cached_endpoints(const NodeId &node_id) const -> Optional<EndpointAdvert> {
+                auto it = endpoint_cache_.find(node_id);
+                if (it == endpoint_cache_.end()) {
+                    return Optional<EndpointAdvert>();
+                }
+                // Check if cached entry is still valid
+                if ((time::now_ms() - it->second.timestamp_ms) > endpoint_cache_ttl_ms_) {
+                    return Optional<EndpointAdvert>();
+                }
+                return it->second;
+            }
+
+            // Get all cached endpoints (for peer discovery)
+            [[nodiscard]] auto get_all_cached_endpoints() const -> Vector<EndpointAdvert> {
+                Vector<EndpointAdvert> result;
+                u64 now = time::now_ms();
+                for (const auto &[node_id, advert] : endpoint_cache_) {
+                    if ((now - advert.timestamp_ms) <= endpoint_cache_ttl_ms_) {
+                        result.push_back(advert);
+                    }
+                }
+                return result;
+            }
+
+            // Clean up stale endpoint cache entries
+            auto cleanup_stale_endpoints() -> usize {
+                Vector<NodeId> to_remove;
+                u64 now = time::now_ms();
+                for (const auto &[node_id, advert] : endpoint_cache_) {
+                    if ((now - advert.timestamp_ms) > endpoint_cache_ttl_ms_) {
+                        to_remove.push_back(node_id);
+                    }
+                }
+                for (const auto &id : to_remove) {
+                    endpoint_cache_.erase(id);
+                }
+                return to_remove.size();
+            }
 
             // =============================================================================
             // Sending
@@ -214,6 +292,58 @@ namespace botlink {
                     }
                 }
 
+                return result::ok();
+            }
+
+            // Send chain sync request to a peer
+            auto send_chain_sync_request(const Endpoint &peer_endpoint) -> VoidRes {
+                if (trust_chain_ == nullptr) {
+                    return result::err(err::invalid("Trust chain not configured"));
+                }
+
+                ChainSyncRequest req;
+                req.requester_id = local_node_id_;
+                req.known_height = trust_chain_->length();
+                req.timestamp_ms = time::now_ms();
+
+                auto buf = dp::serialize<dp::Mode::WITH_VERSION>(req);
+                Vector<u8> payload;
+                for (const auto &b : buf) {
+                    payload.push_back(b);
+                }
+
+                // Use special control message type for chain sync
+                Envelope env = crypto::create_signed_envelope(static_cast<MsgType>(ControlMsgType::ChainSyncRequest),
+                                                              local_node_id_, local_ed25519_, payload);
+
+                auto serialized = crypto::serialize_envelope(env);
+                auto res = socket_->send_to(serialized, to_udp_endpoint(peer_endpoint));
+                if (res.is_err()) {
+                    return result::err(err::io("Failed to send chain sync request"));
+                }
+
+                echo::debug("ControlPlane: Sent chain sync request (local height: ", req.known_height, ")");
+                return result::ok();
+            }
+
+            // Send chain sync response to a peer
+            auto send_chain_sync_response(const ChainSyncResponse &response, const Endpoint &peer_endpoint) -> VoidRes {
+                auto buf = dp::serialize<dp::Mode::WITH_VERSION>(const_cast<ChainSyncResponse &>(response));
+                Vector<u8> payload;
+                for (const auto &b : buf) {
+                    payload.push_back(b);
+                }
+
+                Envelope env = crypto::create_signed_envelope(static_cast<MsgType>(ControlMsgType::ChainSyncResponse),
+                                                              local_node_id_, local_ed25519_, payload);
+
+                auto serialized = crypto::serialize_envelope(env);
+                auto res = socket_->send_to(serialized, to_udp_endpoint(peer_endpoint));
+                if (res.is_err()) {
+                    return result::err(err::io("Failed to send chain sync response"));
+                }
+
+                echo::debug("ControlPlane: Sent chain sync response (events: ", response.events.size(), ")");
                 return result::ok();
             }
 
@@ -393,6 +523,10 @@ namespace botlink {
                     return handle_membership_update(env);
                 case MsgType::EndpointAdvert:
                     return handle_endpoint_advert(env);
+                case static_cast<MsgType>(ControlMsgType::ChainSyncRequest):
+                    return handle_chain_sync_request(env, sender_ep);
+                case static_cast<MsgType>(ControlMsgType::ChainSyncResponse):
+                    return handle_chain_sync_response(env);
                 default:
                     return result::err(err::invalid("Unknown control message type"));
                 }
@@ -499,18 +633,69 @@ namespace botlink {
                     }
                 }
 
-                // Check chain height - if sender's chain is ahead, we may need to sync
-                if (trust_chain_ != nullptr && update.chain_height > trust_chain_->length()) {
-                    echo::info("ControlPlane: Peer has newer chain (", update.chain_height, " vs ",
-                               trust_chain_->length(), ") - chain sync may be needed");
+                // Verify the membership update against local chain state
+                if (trust_chain_ != nullptr) {
+                    // Check if candidate is already a member (shouldn't receive approval for existing member)
+                    if (update.approved && trust_chain_->is_member(update.candidate_id)) {
+                        echo::debug("ControlPlane: Ignoring approval for already-approved member");
+                        return result::ok();
+                    }
+
+                    // Check if candidate was already rejected (shouldn't process duplicate rejection)
+                    auto latest_event = trust_chain_->get_latest_event_for_node(update.candidate_id);
+                    if (latest_event.has_value()) {
+                        if (latest_event->kind == TrustEventKind::JoinRejected && !update.approved) {
+                            echo::debug("ControlPlane: Ignoring duplicate rejection");
+                            return result::ok();
+                        }
+                        if (latest_event->kind == TrustEventKind::MemberRevoked && update.approved) {
+                            echo::warn("ControlPlane: Received approval for revoked member - requires re-application");
+                            return result::err(err::invalid("Cannot approve revoked member directly"));
+                        }
+                    }
+
+                    // Check chain height - if sender's chain is ahead, we need to sync first
+                    if (update.chain_height > trust_chain_->length()) {
+                        echo::info("ControlPlane: Peer has newer chain (", update.chain_height, " vs ",
+                                   trust_chain_->length(), ") - deferring update until chain sync");
+                        // Return OK but don't apply - caller should trigger chain sync
+                        return result::ok();
+                    }
+
+                    // Verify our local chain supports this decision
+                    // If we have voting records, check if the vote tally matches
+                    if (voting_ != nullptr) {
+                        auto local_proposal = voting_->get_proposal(update.candidate_id);
+                        if (local_proposal.has_value()) {
+                            // We have local voting state - verify consistency
+                            if (local_proposal->decided && local_proposal->approved != update.approved) {
+                                echo::warn("ControlPlane: Membership update conflicts with local voting state");
+                                return result::err(err::invalid("Membership update conflicts with local state"));
+                            }
+                        }
+                    }
                 }
 
-                echo::info("ControlPlane: Received membership update - candidate ",
+                echo::info("ControlPlane: Verified and accepted membership update - candidate ",
                            update.approved ? "APPROVED" : "REJECTED");
 
-                // Note: Full handling would require verifying the decision against the chain
-                // For gossip protocol, we trust updates from approved members but should
-                // verify against our own chain state before applying
+                // Apply the update to trust view if we have one and this is an approval
+                if (trust_view_ != nullptr && update.approved) {
+                    // We need the full member info to add - this would come from proposal
+                    if (voting_ != nullptr) {
+                        auto proposal = voting_->get_proposal(update.candidate_id);
+                        if (proposal.has_value()) {
+                            MemberEntry entry;
+                            entry.node_id = proposal->candidate_id;
+                            entry.ed25519_pubkey = proposal->candidate_ed25519;
+                            entry.x25519_pubkey = proposal->candidate_x25519;
+                            entry.status = MemberStatus::Approved;
+                            entry.joined_at_ms = update.timestamp_ms;
+                            trust_view_->add_member(entry);
+                            echo::info("ControlPlane: Added new member to trust view");
+                        }
+                    }
+                }
 
                 return result::ok();
             }
@@ -526,9 +711,117 @@ namespace botlink {
                     return result::err(advert_res.error());
                 }
 
-                echo::debug("Received endpoint advertisement");
-                // TODO: Update peer endpoint cache
+                const auto &advert = advert_res.value();
 
+                // Validate that the advertisement is from the claimed node
+                if (advert.node_id != env.sender_id) {
+                    return result::err(err::permission("Endpoint advertisement node_id mismatch"));
+                }
+
+                // Check if we have an existing entry and only update if newer
+                auto existing = endpoint_cache_.find(advert.node_id);
+                if (existing != endpoint_cache_.end() && existing->second.timestamp_ms >= advert.timestamp_ms) {
+                    echo::debug("ControlPlane: Ignoring stale endpoint advertisement");
+                    return result::ok();
+                }
+
+                // Store the endpoint advertisement in cache
+                endpoint_cache_[advert.node_id] = advert;
+
+                echo::debug("ControlPlane: Stored endpoint advertisement for peer (", advert.endpoints.size(),
+                            " endpoints)");
+
+                return result::ok();
+            }
+
+            auto handle_chain_sync_request(const Envelope &env, const Endpoint &sender_ep) -> VoidRes {
+                // Verify sender is approved member
+                if (trust_view_ != nullptr && !trust_view_->is_member(env.sender_id)) {
+                    return result::err(err::permission("Non-member cannot request chain sync"));
+                }
+
+                if (trust_chain_ == nullptr) {
+                    return result::err(err::invalid("Trust chain not configured"));
+                }
+
+                auto req_res = serial::deserialize<ChainSyncRequest>(env.payload);
+                if (req_res.is_err()) {
+                    return result::err(req_res.error());
+                }
+
+                const auto &req = req_res.value();
+                u64 local_height = trust_chain_->length();
+
+                echo::debug("ControlPlane: Received chain sync request (peer height: ", req.known_height,
+                            ", local height: ", local_height, ")");
+
+                // If peer is already up to date or ahead, nothing to send
+                if (req.known_height >= local_height) {
+                    echo::debug("ControlPlane: Peer already up to date");
+                    return result::ok();
+                }
+
+                // Build response with events the peer doesn't have
+                ChainSyncResponse response;
+                response.chain_height = local_height;
+                response.start_height = req.known_height;
+                response.timestamp_ms = time::now_ms();
+
+                // Get all events from chain and send those after peer's known height
+                auto all_events = trust_chain_->get_all_nodes_with_latest_event();
+                for (const auto &[node_id, evt] : all_events) {
+                    // Include events the peer might not have
+                    response.events.push_back(evt);
+                }
+
+                // Send response back to requester
+                return send_chain_sync_response(response, sender_ep);
+            }
+
+            auto handle_chain_sync_response(const Envelope &env) -> VoidRes {
+                // Verify sender is approved member
+                if (trust_view_ != nullptr && !trust_view_->is_member(env.sender_id)) {
+                    return result::err(err::permission("Non-member cannot send chain sync response"));
+                }
+
+                if (trust_chain_ == nullptr || trust_view_ == nullptr) {
+                    return result::err(err::invalid("Trust chain/view not configured"));
+                }
+
+                auto resp_res = serial::deserialize<ChainSyncResponse>(env.payload);
+                if (resp_res.is_err()) {
+                    return result::err(resp_res.error());
+                }
+
+                const auto &resp = resp_res.value();
+                echo::info("ControlPlane: Received chain sync response with ", resp.events.size(), " events");
+
+                // Process each event and update local state
+                for (const auto &evt : resp.events) {
+                    // Validate and add event to local chain
+                    auto add_res = trust_chain_->add_event(evt);
+                    if (add_res.is_err()) {
+                        echo::warn("ControlPlane: Failed to add synced event: ", add_res.error().message.c_str());
+                        continue;
+                    }
+
+                    // Update trust view based on event type
+                    if (evt.kind == TrustEventKind::JoinApproved) {
+                        MemberEntry entry;
+                        entry.node_id = evt.subject_id;
+                        entry.ed25519_pubkey = evt.subject_pubkey;
+                        entry.x25519_pubkey = evt.subject_x25519;
+                        entry.status = MemberStatus::Approved;
+                        entry.joined_at_ms = evt.timestamp_ms;
+                        trust_view_->add_member(entry);
+                        echo::info("ControlPlane: Synced new member from chain");
+                    } else if (evt.kind == TrustEventKind::MemberRevoked) {
+                        trust_view_->remove_member(evt.subject_id);
+                        echo::info("ControlPlane: Synced member revocation from chain");
+                    }
+                }
+
+                echo::info("ControlPlane: Chain sync complete (new height: ", trust_chain_->length(), ")");
                 return result::ok();
             }
         };

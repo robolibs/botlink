@@ -4,7 +4,7 @@ cmake_minimum_required(VERSION 3.15)
 # Project configuration
 # ==================================================================================================
 set(PROJECT_NAME botlink)
-set(PROJECT_VERSION "0.0.3")
+set(PROJECT_VERSION "0.0.4")
 
 # Dependencies formats:
 #   Git:    set(LIB_DEPS "name|https://github.com/org/repo.git|tag" ...)
@@ -15,7 +15,7 @@ set(LIB_DEPS
     "scan|https://github.com/bresilla/scan.git|0.0.2"
     "datapod|https://github.com/robolibs/datapod.git|0.0.36"
     "wirebit|https://github.com/robolibs/wirebit.git|0.0.10"
-    "netpipe|https://github.com/robolibs/netpipe.git|0.0.7"
+    "netpipe|https://github.com/robolibs/netpipe.git|0.0.8"
     "keylock|https://github.com/robolibs/keylock.git|0.0.4"
     "blockit|https://github.com/robolibs/blockit.git|0.0.6"
     "pkg::libsodium"
@@ -95,7 +95,7 @@ if(${PROJECT_NAME_UPPER}_ENABLE_SIMD)
     endif()
 else()
     # Define macro to disable SIMD in the code
-    add_compile_definitions(FARMTRAX_SIMD_DISABLED)
+    add_compile_definitions(BOTLINK_SIMD_DISABLED)
     message(STATUS "SIMD optimizations disabled")
 endif()
 option(${PROJECT_NAME_UPPER}_BUILD_EXAMPLES "Build examples" OFF)
@@ -163,7 +163,7 @@ if(LIB_SOURCES)
     )
     target_compile_definitions(${PROJECT_NAME} PUBLIC
         $<$<BOOL:${SHORT_NAMESPACE}>:SHORT_NAMESPACE>
-        $<$<BOOL:${EXPOSE_ALL}>:OPTINUM_EXPOSE_ALL>
+        $<$<BOOL:${EXPOSE_ALL}>:BOTLINK_EXPOSE_ALL>
     )
 else()
     add_library(${PROJECT_NAME} INTERFACE)
@@ -175,7 +175,7 @@ else()
         target_compile_definitions(${PROJECT_NAME} INTERFACE SHORT_NAMESPACE)
     endif()
     if(EXPOSE_ALL)
-        target_compile_definitions(${PROJECT_NAME} INTERFACE OPTINUM_EXPOSE_ALL)
+        target_compile_definitions(${PROJECT_NAME} INTERFACE BOTLINK_EXPOSE_ALL)
     endif()
 endif()
 

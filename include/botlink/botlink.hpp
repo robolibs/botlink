@@ -68,9 +68,9 @@ namespace botlink {
 
     // Library version
     inline constexpr u32 VERSION_MAJOR = 0;
-    inline constexpr u32 VERSION_MINOR = 1;
-    inline constexpr u32 VERSION_PATCH = 0;
-    inline constexpr const char *VERSION_STRING = "0.1.0";
+    inline constexpr u32 VERSION_MINOR = 0;
+    inline constexpr u32 VERSION_PATCH = 3;
+    inline constexpr const char *VERSION_STRING = "0.0.3";
 
     // Initialize libsodium (call once at startup)
     inline auto init() -> VoidRes {
@@ -81,3 +81,35 @@ namespace botlink {
     }
 
 } // namespace botlink
+
+// =============================================================================
+// EXPOSE_ALL - Expose internal submodule symbols in global namespace
+// =============================================================================
+
+#ifdef BOTLINK_EXPOSE_ALL
+
+// Expose cryptographic functions
+namespace botlink_crypto = botlink::crypto;
+
+// Expose networking types
+namespace botlink_net = botlink::net;
+
+// Expose configuration types
+namespace botlink_cfg = botlink::cfg;
+
+// Expose trust management types
+using botlink::TrustChain;
+using botlink::TrustEvent;
+using botlink::TrustEventKind;
+
+// Expose result types
+using botlink::Res;
+using botlink::VoidRes;
+
+// Expose core types
+using botlink::NodeId;
+using botlink::PrivateKey;
+using botlink::PublicKey;
+using botlink::Signature;
+
+#endif // BOTLINK_EXPOSE_ALL

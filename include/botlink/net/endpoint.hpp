@@ -10,6 +10,10 @@
 #include <botlink/core/types.hpp>
 #include <datapod/datapod.hpp>
 
+#include <netdb.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+
 namespace botlink {
 
     using namespace dp;
@@ -381,7 +385,100 @@ namespace botlink {
             return result::ok(result);
         }
 
-        // Parse endpoint string "192.168.1.1:51820" or "[::1]:8080"
+        // =============================================================================
+        // DNS Resolution (supports both IPv4 and IPv6)
+        // =============================================================================
+
+        // Resolve hostname to endpoint using getaddrinfo (supports IPv4 and IPv6)
+        [[nodiscard]] inline auto resolve_hostname(const String &hostname, u16 port) -> Res<Endpoint> {
+            struct addrinfo hints{};
+            hints.ai_family = AF_UNSPEC;    // Allow both IPv4 and IPv6
+            hints.ai_socktype = SOCK_DGRAM; // UDP
+            hints.ai_flags = AI_ADDRCONFIG; // Only return addresses we can use
+
+            char port_str[16];
+            snprintf(port_str, sizeof(port_str), "%u", port);
+
+            struct addrinfo *result = nullptr;
+            int ret = getaddrinfo(hostname.c_str(), port_str, &hints, &result);
+            if (ret != 0) {
+                return result::err(err::network(gai_strerror(ret)));
+            }
+
+            if (result == nullptr) {
+                return result::err(err::network("DNS resolution returned no results"));
+            }
+
+            Endpoint ep;
+
+            // Use first result (prefer IPv6 if available)
+            struct addrinfo *addr = result;
+            while (addr != nullptr) {
+                if (addr->ai_family == AF_INET6) {
+                    // IPv6 address
+                    auto *sin6 = reinterpret_cast<struct sockaddr_in6 *>(addr->ai_addr);
+                    ep.family = AddrFamily::IPv6;
+                    ep.port = port;
+                    for (usize i = 0; i < 16; ++i) {
+                        ep.ipv6.octets[i] = sin6->sin6_addr.s6_addr[i];
+                    }
+                    freeaddrinfo(result);
+                    return result::ok(ep);
+                }
+                addr = addr->ai_next;
+            }
+
+            // Fall back to IPv4
+            addr = result;
+            if (addr->ai_family == AF_INET) {
+                auto *sin = reinterpret_cast<struct sockaddr_in *>(addr->ai_addr);
+                ep.family = AddrFamily::IPv4;
+                ep.port = port;
+                u32 ip_addr = ntohl(sin->sin_addr.s_addr);
+                ep.ipv4.octets[0] = static_cast<u8>((ip_addr >> 24) & 0xFF);
+                ep.ipv4.octets[1] = static_cast<u8>((ip_addr >> 16) & 0xFF);
+                ep.ipv4.octets[2] = static_cast<u8>((ip_addr >> 8) & 0xFF);
+                ep.ipv4.octets[3] = static_cast<u8>(ip_addr & 0xFF);
+                freeaddrinfo(result);
+                return result::ok(ep);
+            }
+
+            freeaddrinfo(result);
+            return result::err(err::network("DNS resolution returned unsupported address family"));
+        }
+
+        // Check if a string looks like an IP address (not a hostname)
+        [[nodiscard]] inline auto looks_like_ip_address(const String &str) -> boolean {
+            if (str.empty()) {
+                return false;
+            }
+
+            // IPv6 check: contains colons
+            for (usize i = 0; i < str.size(); ++i) {
+                if (str[i] == ':') {
+                    return true; // Has colons, likely IPv6
+                }
+            }
+
+            // IPv4 check: all digits and dots
+            boolean has_dot = false;
+            for (usize i = 0; i < str.size(); ++i) {
+                char c = str[i];
+                if (c == '.') {
+                    has_dot = true;
+                } else if (c < '0' || c > '9') {
+                    return false; // Has non-digit/non-dot, it's a hostname
+                }
+            }
+
+            return has_dot; // If all digits/dots and has at least one dot, it's IPv4
+        }
+
+        // =============================================================================
+        // Endpoint Parsing
+        // =============================================================================
+
+        // Parse endpoint string "192.168.1.1:51820" or "[::1]:8080" or "hostname:port"
         [[nodiscard]] inline auto parse_endpoint(const String &str) -> Res<Endpoint> {
             // Check if it looks like a URI
             boolean has_scheme = false;
@@ -397,18 +494,17 @@ namespace botlink {
                 if (uri_res.is_err()) {
                     return result::err(uri_res.error());
                 }
-                // Convert to endpoint
-                // For now, assume it's an IP address
-                // TODO: DNS resolution
+
+                // Convert to endpoint - handle IPv6, IPv4, and hostnames
                 if (uri_res.value().is_ipv6) {
-                    // Parse IPv6
+                    // Parse IPv6 literal
                     auto ipv6_res = parse_ipv6_addr(uri_res.value().host);
                     if (ipv6_res.is_err()) {
                         return result::err(ipv6_res.error());
                     }
                     return result::ok(Endpoint(ipv6_res.value(), uri_res.value().port));
-                } else {
-                    // Parse IPv4
+                } else if (looks_like_ip_address(uri_res.value().host)) {
+                    // Parse IPv4 literal
                     std::string host_str(uri_res.value().host.c_str());
                     u32 a = 0, b = 0, c = 0, d = 0;
                     if (sscanf(host_str.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
@@ -417,6 +513,9 @@ namespace botlink {
                     return result::ok(Endpoint(
                         IPv4Addr(static_cast<u8>(a), static_cast<u8>(b), static_cast<u8>(c), static_cast<u8>(d)),
                         uri_res.value().port));
+                } else {
+                    // DNS resolution for hostname (supports IPv4 and IPv6)
+                    return resolve_hostname(uri_res.value().host, uri_res.value().port);
                 }
             }
 
@@ -451,7 +550,7 @@ namespace botlink {
                 }
                 return result::ok(Endpoint(ipv6_res.value(), port_res.value()));
             } else {
-                // IPv4 - require explicit port for direct endpoint format
+                // IPv4 or hostname - require explicit port for direct endpoint format
                 usize port_sep = str.size();
                 for (usize i = 0; i < str.size(); ++i) {
                     if (str[i] == ':') {
@@ -473,14 +572,20 @@ namespace botlink {
                     return result::err(port_res.error());
                 }
 
-                u32 a = 0, b = 0, c = 0, d = 0;
-                if (sscanf(addr_str.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
-                    return result::err(err::invalid("Invalid IPv4 address"));
+                // Check if it's an IP address or hostname
+                if (looks_like_ip_address(addr_str)) {
+                    // Parse IPv4 literal
+                    u32 a = 0, b = 0, c = 0, d = 0;
+                    if (sscanf(addr_str.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
+                        return result::err(err::invalid("Invalid IPv4 address"));
+                    }
+                    return result::ok(Endpoint(
+                        IPv4Addr(static_cast<u8>(a), static_cast<u8>(b), static_cast<u8>(c), static_cast<u8>(d)),
+                        port_res.value()));
+                } else {
+                    // DNS resolution for hostname (supports IPv4 and IPv6)
+                    return resolve_hostname(addr_str, port_res.value());
                 }
-
-                return result::ok(
-                    Endpoint(IPv4Addr(static_cast<u8>(a), static_cast<u8>(b), static_cast<u8>(c), static_cast<u8>(d)),
-                             port_res.value()));
             }
         }
 
