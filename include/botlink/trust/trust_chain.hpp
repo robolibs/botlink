@@ -11,6 +11,7 @@
 #include <botlink/core/time.hpp>
 #include <botlink/core/types.hpp>
 #include <botlink/crypto/identity.hpp>
+#include <botlink/crypto/sign.hpp>
 #include <botlink/trust/trust_event.hpp>
 #include <datapod/datapod.hpp>
 
@@ -27,6 +28,9 @@ namespace botlink {
         blockit::Chain<TrustEvent> chain_;
         String chain_id_;
         NodeId local_node_id_;
+        PrivateKey local_ed25519_priv_;
+        PublicKey local_ed25519_pub_;
+        Map<NodeId, PublicKey> member_pubkeys_; // Cache of member public keys for verification
 
       public:
         TrustChain() = default;
@@ -55,27 +59,122 @@ namespace botlink {
         // Set local node ID
         auto set_local_node(const NodeId &id) -> void { local_node_id_ = id; }
 
+        // Set local signing keys
+        auto set_local_keys(const PrivateKey &priv, const PublicKey &pub) -> void {
+            local_ed25519_priv_ = priv;
+            local_ed25519_pub_ = pub;
+        }
+
+        // Register a member's public key for signature verification
+        auto register_member_pubkey(const NodeId &node_id, const PublicKey &pubkey) -> void {
+            member_pubkeys_[node_id] = pubkey;
+        }
+
         // Get chain ID
         [[nodiscard]] auto chain_id() const -> const String & { return chain_id_; }
 
         // =============================================================================
-        // Membership Operations (Unsigned - for local use)
+        // Membership Operations (with Ed25519 Signatures)
         // =============================================================================
 
-        // Add an event to the chain (for local chains, uses placeholder signature)
+        // Sign event data and return signature
+        auto sign_event(const TrustEvent &evt) -> Vector<u8> {
+            // Serialize event for signing
+            Vector<u8> data = trust::serialize_event(evt);
+
+            // Sign with local Ed25519 key
+            Signature sig = crypto::ed25519_sign(local_ed25519_priv_, data);
+
+            // Convert signature to vector
+            Vector<u8> sig_vec;
+            sig_vec.reserve(SIGNATURE_SIZE);
+            for (usize i = 0; i < SIGNATURE_SIZE; ++i) {
+                sig_vec.push_back(sig.data[i]);
+            }
+            return sig_vec;
+        }
+
+        // Verify event signature
+        auto verify_event_signature(const TrustEvent &evt, const Vector<u8> &sig_vec, const PublicKey &pubkey)
+            -> boolean {
+            if (sig_vec.size() != SIGNATURE_SIZE) {
+                return false;
+            }
+
+            // Convert vector to Signature
+            Signature sig;
+            for (usize i = 0; i < SIGNATURE_SIZE; ++i) {
+                sig.data[i] = sig_vec[i];
+            }
+
+            // Serialize event for verification
+            Vector<u8> data = trust::serialize_event(evt);
+
+            return crypto::ed25519_verify(pubkey, data, sig);
+        }
+
+        // Add an event to the chain with proper Ed25519 signature
         auto add_event(const TrustEvent &evt) -> VoidRes {
             std::string tx_uuid =
                 "evt-" + std::to_string(evt.timestamp_ms) + "-" + std::to_string(static_cast<u8>(evt.kind));
 
             blockit::Transaction<TrustEvent> tx(tx_uuid, evt);
-            // Add placeholder signature for local chain validation
-            // (blockit requires non-empty signature but doesn't verify it for basic addBlock)
-            tx.signature_ = dp::Vector<u8>{0x00};
+
+            // Sign the event with local Ed25519 key
+            tx.signature_ = sign_event(evt);
+
             blockit::Block<TrustEvent> block({tx});
 
             auto add_result = chain_.addBlock(block);
             if (!add_result.is_ok()) {
                 return result::err(err::trust(add_result.error().message.c_str()));
+            }
+
+            // Register the subject's public key for future verification if this is an approval
+            if (evt.kind == TrustEventKind::JoinApproved) {
+                member_pubkeys_[evt.subject_id] = evt.subject_pubkey;
+            }
+
+            return result::ok();
+        }
+
+        // Add an event from a remote peer (with signature verification)
+        auto add_remote_event(const TrustEvent &evt, const Vector<u8> &signature) -> VoidRes {
+            // Look up the actor's public key
+            auto it = member_pubkeys_.find(evt.actor_id);
+            if (it == member_pubkeys_.end()) {
+                // For genesis events, actor is self-signed
+                if (evt.kind == TrustEventKind::JoinApproved && evt.actor_id == evt.subject_id) {
+                    // Genesis self-approval - verify against subject's pubkey
+                    if (!verify_event_signature(evt, signature, evt.subject_pubkey)) {
+                        return result::err(err::crypto("Invalid signature on genesis event"));
+                    }
+                } else {
+                    return result::err(err::not_found("Unknown actor - cannot verify signature"));
+                }
+            } else {
+                // Verify signature against known member's public key
+                if (!verify_event_signature(evt, signature, it->second)) {
+                    return result::err(err::crypto("Invalid event signature"));
+                }
+            }
+
+            std::string tx_uuid =
+                "evt-" + std::to_string(evt.timestamp_ms) + "-" + std::to_string(static_cast<u8>(evt.kind));
+
+            blockit::Transaction<TrustEvent> tx(tx_uuid, evt);
+            tx.signature_ = signature;
+
+            blockit::Block<TrustEvent> block({tx});
+
+            auto add_result = chain_.addBlock(block);
+            if (!add_result.is_ok()) {
+                return result::err(err::trust(add_result.error().message.c_str()));
+            }
+
+            // Register the subject's public key for future verification if this is an approval
+            if (evt.kind == TrustEventKind::JoinApproved) {
+                member_pubkeys_[evt.subject_id] = evt.subject_pubkey;
             }
 
             return result::ok();

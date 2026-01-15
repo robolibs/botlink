@@ -391,10 +391,10 @@ namespace botlink {
 
         // Resolve hostname to endpoint using getaddrinfo (supports IPv4 and IPv6)
         [[nodiscard]] inline auto resolve_hostname(const String &hostname, u16 port) -> Res<Endpoint> {
-            struct addrinfo hints {};
-            hints.ai_family = AF_UNSPEC;     // Allow both IPv4 and IPv6
-            hints.ai_socktype = SOCK_DGRAM;  // UDP
-            hints.ai_flags = AI_ADDRCONFIG;  // Only return addresses we can use
+            struct addrinfo hints{};
+            hints.ai_family = AF_UNSPEC;    // Allow both IPv4 and IPv6
+            hints.ai_socktype = SOCK_DGRAM; // UDP
+            hints.ai_flags = AI_ADDRCONFIG; // Only return addresses we can use
 
             char port_str[16];
             snprintf(port_str, sizeof(port_str), "%u", port);
@@ -579,9 +579,9 @@ namespace botlink {
                     if (sscanf(addr_str.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
                         return result::err(err::invalid("Invalid IPv4 address"));
                     }
-                    return result::ok(
-                        Endpoint(IPv4Addr(static_cast<u8>(a), static_cast<u8>(b), static_cast<u8>(c), static_cast<u8>(d)),
-                                 port_res.value()));
+                    return result::ok(Endpoint(
+                        IPv4Addr(static_cast<u8>(a), static_cast<u8>(b), static_cast<u8>(c), static_cast<u8>(d)),
+                        port_res.value()));
                 } else {
                     // DNS resolution for hostname (supports IPv4 and IPv6)
                     return resolve_hostname(addr_str, port_res.value());

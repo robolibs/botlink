@@ -628,8 +628,8 @@ namespace botlink {
                 }
 
                 // Derive new session keys (we are responding, so we're "responder" role)
-                auto [new_send_key, new_recv_key] =
-                    crypto::derive_responder_keys(shared_res.value(), rekey.sender_id, local_node_id_, rekey.new_key_id);
+                auto [new_send_key, new_recv_key] = crypto::derive_responder_keys(shared_res.value(), rekey.sender_id,
+                                                                                  local_node_id_, rekey.new_key_id);
 
                 // Update session with new keys
                 peer_table_->create_session(rekey.sender_id, new_send_key, new_recv_key);

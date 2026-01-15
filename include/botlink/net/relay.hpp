@@ -454,9 +454,33 @@ namespace botlink {
                 return result::ok();
             }
 
-            auto handle_disconnect(const Vector<u8> & /*data*/, const Endpoint & /*sender_ep*/) -> VoidRes {
-                // TODO: Remove client registration
-                echo::info("RelayServer: Client disconnected");
+            auto handle_disconnect(const Vector<u8> &data, const Endpoint & /*sender_ep*/) -> VoidRes {
+                if (data.size() < 2) {
+                    return result::err(err::invalid("Data too short"));
+                }
+
+                // Parse the disconnect request to get the node ID
+                auto req_res = serial::deserialize<RelayConnectRequest>(data, 1);
+                if (req_res.is_err()) {
+                    return result::err(req_res.error());
+                }
+                const auto &req = req_res.value();
+
+                // Remove client endpoint registration
+                client_endpoints_.erase(req.requester_id);
+
+                // Remove all connection mappings for this client
+                connections_.erase(req.requester_id);
+
+                // Also remove this client from any other node's connection list
+                for (auto &[node_id, peers] : connections_) {
+                    auto it = std::find(peers.begin(), peers.end(), req.requester_id);
+                    if (it != peers.end()) {
+                        peers.erase(it);
+                    }
+                }
+
+                echo::info("RelayServer: Client disconnected and registrations removed");
                 return result::ok();
             }
 

@@ -13,6 +13,7 @@
 #include <datapod/datapod.hpp>
 #include <echo/echo.hpp>
 
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -223,19 +224,197 @@ namespace botlink {
 
                     echo::info("Generated new identity: ", config_.identity.ed25519_id.substr(0, 16).c_str(), "...");
                 } else {
-                    // TODO: Load from file or paste
-                    echo::warn("Manual key entry not implemented, generating new keys");
-                    auto [ed_priv, ed_pub] = crypto::generate_ed25519_keypair();
-                    config_.identity.ed25519_private = ed_priv;
-                    config_.identity.ed25519_public = ed_pub;
+                    // Import existing keys
+                    Vector<String> import_methods;
+                    import_methods.push_back("Load from file");
+                    import_methods.push_back("Paste base64");
+                    import_methods.push_back("Paste hex");
+                    usize method = prompt_choice("Key import method", import_methods, 0);
 
+                    boolean import_success = false;
+
+                    if (method == 0) {
+                        // Load from file
+                        import_success = import_keys_from_file();
+                    } else if (method == 1) {
+                        // Paste base64
+                        import_success = import_keys_base64();
+                    } else {
+                        // Paste hex
+                        import_success = import_keys_hex();
+                    }
+
+                    if (!import_success) {
+                        echo::warn("Key import failed, generating new keys instead");
+                        auto [ed_priv, ed_pub] = crypto::generate_ed25519_keypair();
+                        config_.identity.ed25519_private = ed_priv;
+                        config_.identity.ed25519_public = ed_pub;
+
+                        auto [x_priv, x_pub] = crypto::generate_x25519_keypair();
+                        config_.identity.x25519_private = x_priv;
+                        config_.identity.x25519_public = x_pub;
+
+                        NodeId node_id = crypto::node_id_from_pubkey(ed_pub);
+                        config_.identity.ed25519_id = crypto::node_id_to_hex(node_id);
+                    }
+                }
+            }
+
+            // Import keys from file
+            auto import_keys_from_file() -> boolean {
+                String ed_priv_path = prompt_string("Ed25519 private key file path", "");
+                if (ed_priv_path.empty()) {
+                    echo::warn("No file path provided");
+                    return false;
+                }
+
+                // Read Ed25519 private key
+                std::ifstream ed_file(ed_priv_path.c_str());
+                if (!ed_file.is_open()) {
+                    echo::warn("Failed to open Ed25519 key file");
+                    return false;
+                }
+
+                std::string ed_content;
+                std::getline(ed_file, ed_content);
+                ed_file.close();
+
+                // Try base64 first, then hex
+                auto ed_priv_res = crypto::private_key_from_base64(KeyB64(ed_content.c_str()));
+                if (ed_priv_res.is_err()) {
+                    ed_priv_res = crypto::private_key_from_hex(String(ed_content.c_str()));
+                }
+
+                if (ed_priv_res.is_err()) {
+                    echo::warn("Failed to parse Ed25519 private key");
+                    return false;
+                }
+
+                config_.identity.ed25519_private = ed_priv_res.value();
+                config_.identity.ed25519_public = crypto::ed25519_public_from_private(config_.identity.ed25519_private);
+
+                // Ask for X25519 key or derive from Ed25519
+                boolean derive_x25519 = prompt_bool("Derive X25519 key from Ed25519 (or enter separately)", true);
+                if (derive_x25519) {
+                    // Generate X25519 keypair (independent from Ed25519)
                     auto [x_priv, x_pub] = crypto::generate_x25519_keypair();
                     config_.identity.x25519_private = x_priv;
                     config_.identity.x25519_public = x_pub;
+                } else {
+                    String x_priv_path = prompt_string("X25519 private key file path", "");
+                    if (!x_priv_path.empty()) {
+                        std::ifstream x_file(x_priv_path.c_str());
+                        if (x_file.is_open()) {
+                            std::string x_content;
+                            std::getline(x_file, x_content);
+                            x_file.close();
 
-                    NodeId node_id = crypto::node_id_from_pubkey(ed_pub);
-                    config_.identity.ed25519_id = crypto::node_id_to_hex(node_id);
+                            auto x_priv_res = crypto::private_key_from_base64(KeyB64(x_content.c_str()));
+                            if (x_priv_res.is_err()) {
+                                x_priv_res = crypto::private_key_from_hex(String(x_content.c_str()));
+                            }
+
+                            if (x_priv_res.is_ok()) {
+                                config_.identity.x25519_private = x_priv_res.value();
+                                config_.identity.x25519_public =
+                                    crypto::x25519_public_from_private(config_.identity.x25519_private);
+                            }
+                        }
+                    }
                 }
+
+                // Derive NodeId
+                NodeId node_id = crypto::node_id_from_pubkey(config_.identity.ed25519_public);
+                config_.identity.ed25519_id = crypto::node_id_to_hex(node_id);
+
+                echo::info("Imported identity: ", config_.identity.ed25519_id.substr(0, 16).c_str(), "...");
+                return true;
+            }
+
+            // Import keys from pasted base64
+            auto import_keys_base64() -> boolean {
+                String ed_b64 = prompt_string("Ed25519 private key (base64)", "");
+                if (ed_b64.empty()) {
+                    return false;
+                }
+
+                auto ed_priv_res = crypto::private_key_from_base64(KeyB64(ed_b64.c_str()));
+                if (ed_priv_res.is_err()) {
+                    echo::warn("Invalid base64 Ed25519 key");
+                    return false;
+                }
+
+                config_.identity.ed25519_private = ed_priv_res.value();
+                config_.identity.ed25519_public = crypto::ed25519_public_from_private(config_.identity.ed25519_private);
+
+                // X25519 key
+                String x_b64 = prompt_string("X25519 private key (base64, or empty to generate)", "");
+                if (!x_b64.empty()) {
+                    auto x_priv_res = crypto::private_key_from_base64(KeyB64(x_b64.c_str()));
+                    if (x_priv_res.is_ok()) {
+                        config_.identity.x25519_private = x_priv_res.value();
+                        config_.identity.x25519_public =
+                            crypto::x25519_public_from_private(config_.identity.x25519_private);
+                    } else {
+                        auto [x_priv, x_pub] = crypto::generate_x25519_keypair();
+                        config_.identity.x25519_private = x_priv;
+                        config_.identity.x25519_public = x_pub;
+                    }
+                } else {
+                    auto [x_priv, x_pub] = crypto::generate_x25519_keypair();
+                    config_.identity.x25519_private = x_priv;
+                    config_.identity.x25519_public = x_pub;
+                }
+
+                // Derive NodeId
+                NodeId node_id = crypto::node_id_from_pubkey(config_.identity.ed25519_public);
+                config_.identity.ed25519_id = crypto::node_id_to_hex(node_id);
+
+                echo::info("Imported identity: ", config_.identity.ed25519_id.substr(0, 16).c_str(), "...");
+                return true;
+            }
+
+            // Import keys from pasted hex
+            auto import_keys_hex() -> boolean {
+                String ed_hex = prompt_string("Ed25519 private key (hex)", "");
+                if (ed_hex.empty()) {
+                    return false;
+                }
+
+                auto ed_priv_res = crypto::private_key_from_hex(ed_hex);
+                if (ed_priv_res.is_err()) {
+                    echo::warn("Invalid hex Ed25519 key");
+                    return false;
+                }
+
+                config_.identity.ed25519_private = ed_priv_res.value();
+                config_.identity.ed25519_public = crypto::ed25519_public_from_private(config_.identity.ed25519_private);
+
+                // X25519 key
+                String x_hex = prompt_string("X25519 private key (hex, or empty to generate)", "");
+                if (!x_hex.empty()) {
+                    auto x_priv_res = crypto::private_key_from_hex(x_hex);
+                    if (x_priv_res.is_ok()) {
+                        config_.identity.x25519_private = x_priv_res.value();
+                        config_.identity.x25519_public =
+                            crypto::x25519_public_from_private(config_.identity.x25519_private);
+                    } else {
+                        auto [x_priv, x_pub] = crypto::generate_x25519_keypair();
+                        config_.identity.x25519_private = x_priv;
+                        config_.identity.x25519_public = x_pub;
+                    }
+                } else {
+                    auto [x_priv, x_pub] = crypto::generate_x25519_keypair();
+                    config_.identity.x25519_private = x_priv;
+                    config_.identity.x25519_public = x_pub;
+                }
+
+                // Derive NodeId
+                NodeId node_id = crypto::node_id_from_pubkey(config_.identity.ed25519_public);
+                config_.identity.ed25519_id = crypto::node_id_to_hex(node_id);
+
+                echo::info("Imported identity: ", config_.identity.ed25519_id.substr(0, 16).c_str(), "...");
+                return true;
             }
 
             // Step 4: Trust configuration
@@ -273,9 +452,39 @@ namespace botlink {
                         entry.endpoint = ep_res.value();
                     }
 
-                    // Note: In real usage, pubkey would be entered as base64
-                    // For now, generate placeholder
-                    echo::warn("Bootstrap pubkey should be entered manually in the config file");
+                    // Bootstrap public key entry
+                    Vector<String> key_formats;
+                    key_formats.push_back("Base64");
+                    key_formats.push_back("Hex");
+                    usize key_format = prompt_choice("Public key format", key_formats, 0);
+
+                    if (key_format == 0) {
+                        String pubkey_b64 = prompt_string("Bootstrap public key (base64)", "");
+                        if (!pubkey_b64.empty()) {
+                            auto pubkey_res = crypto::public_key_from_base64(KeyB64(pubkey_b64.c_str()));
+                            if (pubkey_res.is_ok()) {
+                                entry.pubkey = pubkey_res.value();
+                                echo::info("Bootstrap public key accepted");
+                            } else {
+                                echo::warn("Invalid base64 public key - bootstrap entry may not work");
+                            }
+                        } else {
+                            echo::warn("No public key provided - bootstrap entry may not work");
+                        }
+                    } else {
+                        String pubkey_hex = prompt_string("Bootstrap public key (hex)", "");
+                        if (!pubkey_hex.empty()) {
+                            auto pubkey_res = crypto::public_key_from_hex(pubkey_hex);
+                            if (pubkey_res.is_ok()) {
+                                entry.pubkey = pubkey_res.value();
+                                echo::info("Bootstrap public key accepted");
+                            } else {
+                                echo::warn("Invalid hex public key - bootstrap entry may not work");
+                            }
+                        } else {
+                            echo::warn("No public key provided - bootstrap entry may not work");
+                        }
+                    }
 
                     config_.trust.bootstraps.push_back(entry);
 

@@ -104,7 +104,7 @@ namespace botlink {
 
         struct ChainSyncRequest {
             NodeId requester_id;
-            u64 known_height = 0;  // Height of local chain
+            u64 known_height = 0; // Height of local chain
             u64 timestamp_ms = 0;
 
             ChainSyncRequest() = default;
@@ -114,9 +114,9 @@ namespace botlink {
         };
 
         struct ChainSyncResponse {
-            u64 chain_height = 0;        // Total chain height
-            u64 start_height = 0;        // Height of first event in this response
-            Vector<TrustEvent> events;   // Events from start_height onwards
+            u64 chain_height = 0;      // Total chain height
+            u64 start_height = 0;      // Height of first event in this response
+            Vector<TrustEvent> events; // Events from start_height onwards
             u64 timestamp_ms = 0;
 
             ChainSyncResponse() = default;
@@ -147,6 +147,10 @@ namespace botlink {
             // Envelope validation
             u64 max_envelope_age_ms_ = 60000; // 60 seconds max age for control messages
 
+            // Endpoint advertisement cache - stores peer endpoint advertisements for address refresh
+            Map<NodeId, EndpointAdvert> endpoint_cache_;
+            u64 endpoint_cache_ttl_ms_ = 300000; // 5 minutes TTL for cached endpoints
+
           public:
             ControlPlane(const NodeId &local_id, const PrivateKey &ed25519_priv, const PublicKey &ed25519_pub,
                          TrustView *trust_view, TrustChain *trust_chain, Sponsor *sponsor, VotingManager *voting,
@@ -161,6 +165,51 @@ namespace botlink {
 
             auto set_rate_limit_ms(u64 ms) -> void { rate_limit_ms_ = ms; }
             auto set_max_envelope_age_ms(u64 ms) -> void { max_envelope_age_ms_ = ms; }
+            auto set_endpoint_cache_ttl_ms(u64 ms) -> void { endpoint_cache_ttl_ms_ = ms; }
+
+            // =============================================================================
+            // Endpoint Cache Access
+            // =============================================================================
+
+            // Get cached endpoint advertisement for a peer
+            [[nodiscard]] auto get_cached_endpoints(const NodeId &node_id) const -> Optional<EndpointAdvert> {
+                auto it = endpoint_cache_.find(node_id);
+                if (it == endpoint_cache_.end()) {
+                    return Optional<EndpointAdvert>();
+                }
+                // Check if cached entry is still valid
+                if ((time::now_ms() - it->second.timestamp_ms) > endpoint_cache_ttl_ms_) {
+                    return Optional<EndpointAdvert>();
+                }
+                return it->second;
+            }
+
+            // Get all cached endpoints (for peer discovery)
+            [[nodiscard]] auto get_all_cached_endpoints() const -> Vector<EndpointAdvert> {
+                Vector<EndpointAdvert> result;
+                u64 now = time::now_ms();
+                for (const auto &[node_id, advert] : endpoint_cache_) {
+                    if ((now - advert.timestamp_ms) <= endpoint_cache_ttl_ms_) {
+                        result.push_back(advert);
+                    }
+                }
+                return result;
+            }
+
+            // Clean up stale endpoint cache entries
+            auto cleanup_stale_endpoints() -> usize {
+                Vector<NodeId> to_remove;
+                u64 now = time::now_ms();
+                for (const auto &[node_id, advert] : endpoint_cache_) {
+                    if ((now - advert.timestamp_ms) > endpoint_cache_ttl_ms_) {
+                        to_remove.push_back(node_id);
+                    }
+                }
+                for (const auto &id : to_remove) {
+                    endpoint_cache_.erase(id);
+                }
+                return to_remove.size();
+            }
 
             // =============================================================================
             // Sending
@@ -264,8 +313,8 @@ namespace botlink {
                 }
 
                 // Use special control message type for chain sync
-                Envelope env = crypto::create_signed_envelope(
-                    static_cast<MsgType>(ControlMsgType::ChainSyncRequest), local_node_id_, local_ed25519_, payload);
+                Envelope env = crypto::create_signed_envelope(static_cast<MsgType>(ControlMsgType::ChainSyncRequest),
+                                                              local_node_id_, local_ed25519_, payload);
 
                 auto serialized = crypto::serialize_envelope(env);
                 auto res = socket_->send_to(serialized, to_udp_endpoint(peer_endpoint));
@@ -285,8 +334,8 @@ namespace botlink {
                     payload.push_back(b);
                 }
 
-                Envelope env = crypto::create_signed_envelope(
-                    static_cast<MsgType>(ControlMsgType::ChainSyncResponse), local_node_id_, local_ed25519_, payload);
+                Envelope env = crypto::create_signed_envelope(static_cast<MsgType>(ControlMsgType::ChainSyncResponse),
+                                                              local_node_id_, local_ed25519_, payload);
 
                 auto serialized = crypto::serialize_envelope(env);
                 auto res = socket_->send_to(serialized, to_udp_endpoint(peer_endpoint));
@@ -584,18 +633,69 @@ namespace botlink {
                     }
                 }
 
-                // Check chain height - if sender's chain is ahead, we may need to sync
-                if (trust_chain_ != nullptr && update.chain_height > trust_chain_->length()) {
-                    echo::info("ControlPlane: Peer has newer chain (", update.chain_height, " vs ",
-                               trust_chain_->length(), ") - chain sync may be needed");
+                // Verify the membership update against local chain state
+                if (trust_chain_ != nullptr) {
+                    // Check if candidate is already a member (shouldn't receive approval for existing member)
+                    if (update.approved && trust_chain_->is_member(update.candidate_id)) {
+                        echo::debug("ControlPlane: Ignoring approval for already-approved member");
+                        return result::ok();
+                    }
+
+                    // Check if candidate was already rejected (shouldn't process duplicate rejection)
+                    auto latest_event = trust_chain_->get_latest_event_for_node(update.candidate_id);
+                    if (latest_event.has_value()) {
+                        if (latest_event->kind == TrustEventKind::JoinRejected && !update.approved) {
+                            echo::debug("ControlPlane: Ignoring duplicate rejection");
+                            return result::ok();
+                        }
+                        if (latest_event->kind == TrustEventKind::MemberRevoked && update.approved) {
+                            echo::warn("ControlPlane: Received approval for revoked member - requires re-application");
+                            return result::err(err::invalid("Cannot approve revoked member directly"));
+                        }
+                    }
+
+                    // Check chain height - if sender's chain is ahead, we need to sync first
+                    if (update.chain_height > trust_chain_->length()) {
+                        echo::info("ControlPlane: Peer has newer chain (", update.chain_height, " vs ",
+                                   trust_chain_->length(), ") - deferring update until chain sync");
+                        // Return OK but don't apply - caller should trigger chain sync
+                        return result::ok();
+                    }
+
+                    // Verify our local chain supports this decision
+                    // If we have voting records, check if the vote tally matches
+                    if (voting_ != nullptr) {
+                        auto local_proposal = voting_->get_proposal(update.candidate_id);
+                        if (local_proposal.has_value()) {
+                            // We have local voting state - verify consistency
+                            if (local_proposal->decided && local_proposal->approved != update.approved) {
+                                echo::warn("ControlPlane: Membership update conflicts with local voting state");
+                                return result::err(err::invalid("Membership update conflicts with local state"));
+                            }
+                        }
+                    }
                 }
 
-                echo::info("ControlPlane: Received membership update - candidate ",
+                echo::info("ControlPlane: Verified and accepted membership update - candidate ",
                            update.approved ? "APPROVED" : "REJECTED");
 
-                // Note: Full handling would require verifying the decision against the chain
-                // For gossip protocol, we trust updates from approved members but should
-                // verify against our own chain state before applying
+                // Apply the update to trust view if we have one and this is an approval
+                if (trust_view_ != nullptr && update.approved) {
+                    // We need the full member info to add - this would come from proposal
+                    if (voting_ != nullptr) {
+                        auto proposal = voting_->get_proposal(update.candidate_id);
+                        if (proposal.has_value()) {
+                            MemberEntry entry;
+                            entry.node_id = proposal->candidate_id;
+                            entry.ed25519_pubkey = proposal->candidate_ed25519;
+                            entry.x25519_pubkey = proposal->candidate_x25519;
+                            entry.status = MemberStatus::Approved;
+                            entry.joined_at_ms = update.timestamp_ms;
+                            trust_view_->add_member(entry);
+                            echo::info("ControlPlane: Added new member to trust view");
+                        }
+                    }
+                }
 
                 return result::ok();
             }
@@ -611,8 +711,25 @@ namespace botlink {
                     return result::err(advert_res.error());
                 }
 
-                echo::debug("Received endpoint advertisement");
-                // TODO: Update peer endpoint cache
+                const auto &advert = advert_res.value();
+
+                // Validate that the advertisement is from the claimed node
+                if (advert.node_id != env.sender_id) {
+                    return result::err(err::permission("Endpoint advertisement node_id mismatch"));
+                }
+
+                // Check if we have an existing entry and only update if newer
+                auto existing = endpoint_cache_.find(advert.node_id);
+                if (existing != endpoint_cache_.end() && existing->second.timestamp_ms >= advert.timestamp_ms) {
+                    echo::debug("ControlPlane: Ignoring stale endpoint advertisement");
+                    return result::ok();
+                }
+
+                // Store the endpoint advertisement in cache
+                endpoint_cache_[advert.node_id] = advert;
+
+                echo::debug("ControlPlane: Stored endpoint advertisement for peer (", advert.endpoints.size(),
+                            " endpoints)");
 
                 return result::ok();
             }
