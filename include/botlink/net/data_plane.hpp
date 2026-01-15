@@ -500,6 +500,62 @@ namespace botlink {
             }
 
             // =============================================================================
+            // Rekey
+            // =============================================================================
+
+            // Initiate rekey with a peer
+            auto send_rekey(const NodeId &peer_id) -> VoidRes {
+                auto peer = peer_table_->get_peer(peer_id);
+                if (!peer.has_value()) {
+                    return result::err(err::not_found("Peer not found"));
+                }
+
+                if (!(*peer)->has_session()) {
+                    return result::err(err::invalid("No session with peer"));
+                }
+
+                auto ep = (*peer)->preferred_endpoint();
+                if (!ep.has_value()) {
+                    return result::err(err::invalid("No endpoint for peer"));
+                }
+
+                // Generate new ephemeral key for rekey
+                auto [new_priv, new_pub] = crypto::generate_x25519_keypair();
+
+                // Create rekey request
+                RekeyRequest rekey;
+                rekey.sender_id = local_node_id_;
+                rekey.new_x25519 = new_pub;
+                rekey.new_key_id = (*peer)->session->send_key.key_id + 1;
+                rekey.timestamp_ms = time::now_ms();
+
+                // Serialize and send
+                auto buf = dp::serialize<dp::Mode::WITH_VERSION>(rekey);
+                Vector<u8> payload;
+                payload.push_back(static_cast<u8>(DataMsgType::Rekey));
+                for (const auto &b : buf) {
+                    payload.push_back(b);
+                }
+
+                auto res = socket_->send_to(payload, to_udp_endpoint(ep.value()));
+                if (res.is_err()) {
+                    return result::err(err::io("Failed to send rekey request"));
+                }
+
+                // Store pending rekey session
+                HandshakeSession hs;
+                hs.peer_id = peer_id;
+                hs.state = HandshakeState::InitSent;
+                hs.local_ephemeral_priv = new_priv;
+                hs.local_ephemeral_pub = new_pub;
+                hs.started_at_ms = time::now_ms();
+                handshakes_[peer_id] = hs;
+
+                echo::info("DataPlane: Sent rekey request to peer");
+                return result::ok();
+            }
+
+            // =============================================================================
             // Main Handler
             // =============================================================================
 
@@ -527,12 +583,76 @@ namespace botlink {
                     echo::debug("Received keepalive");
                     return result::ok();
                 case DataMsgType::Rekey:
-                    echo::debug("Received rekey request");
-                    // TODO: Handle rekey
-                    return result::ok();
+                    return handle_rekey(data, sender_ep);
                 default:
                     return result::err(err::invalid("Unknown data message type"));
                 }
+            }
+
+          private:
+            // Handle incoming rekey request
+            auto handle_rekey(const Vector<u8> &data, const Endpoint &sender_ep) -> VoidRes {
+                if (data.size() < 2) {
+                    return result::err(err::invalid("Rekey data too short"));
+                }
+
+                auto rekey_res = serial::deserialize<RekeyRequest>(data, 1);
+                if (rekey_res.is_err()) {
+                    return result::err(rekey_res.error());
+                }
+
+                const auto &rekey = rekey_res.value();
+
+                // Verify sender is an approved member
+                if (trust_view_ != nullptr && !trust_view_->is_member(rekey.sender_id)) {
+                    return result::err(err::permission("Non-member cannot send rekey"));
+                }
+
+                // Get peer
+                auto peer = peer_table_->get_peer(rekey.sender_id);
+                if (!peer.has_value()) {
+                    return result::err(err::not_found("Unknown peer"));
+                }
+
+                if (!(*peer)->has_session()) {
+                    return result::err(err::invalid("No existing session with peer"));
+                }
+
+                // Generate our new ephemeral key
+                auto [new_priv, new_pub] = crypto::generate_x25519_keypair();
+
+                // Compute new shared secret
+                auto shared_res = crypto::x25519_shared_secret(new_priv, rekey.new_x25519);
+                if (shared_res.is_err()) {
+                    return result::err(shared_res.error());
+                }
+
+                // Derive new session keys (we are responding, so we're "responder" role)
+                auto [new_send_key, new_recv_key] =
+                    crypto::derive_responder_keys(shared_res.value(), rekey.sender_id, local_node_id_, rekey.new_key_id);
+
+                // Update session with new keys
+                peer_table_->create_session(rekey.sender_id, new_send_key, new_recv_key);
+
+                // Send rekey response with our new public key
+                RekeyRequest response;
+                response.sender_id = local_node_id_;
+                response.new_x25519 = new_pub;
+                response.new_key_id = rekey.new_key_id;
+                response.timestamp_ms = time::now_ms();
+
+                auto buf = dp::serialize<dp::Mode::WITH_VERSION>(response);
+                Vector<u8> payload;
+                payload.push_back(static_cast<u8>(DataMsgType::Rekey));
+                for (const auto &b : buf) {
+                    payload.push_back(b);
+                }
+
+                socket_->send_to(payload, to_udp_endpoint(sender_ep));
+
+                metrics::inc_handshakes_completed();
+                echo::info("DataPlane: Completed rekey as responder");
+                return result::ok();
             }
 
             // =============================================================================

@@ -36,6 +36,8 @@ namespace botlink {
             MembershipUpdate = 0x04,
             EndpointAdvert = 0x05,
             MembershipSnapshot = 0x06,
+            ChainSyncRequest = 0x07,
+            ChainSyncResponse = 0x08,
         };
 
         // =============================================================================
@@ -94,6 +96,33 @@ namespace botlink {
 
             auto members() noexcept { return std::tie(member_entries, chain_height, timestamp_ms); }
             auto members() const noexcept { return std::tie(member_entries, chain_height, timestamp_ms); }
+        };
+
+        // =============================================================================
+        // Chain Sync Request/Response - Synchronize trust chain with peers
+        // =============================================================================
+
+        struct ChainSyncRequest {
+            NodeId requester_id;
+            u64 known_height = 0;  // Height of local chain
+            u64 timestamp_ms = 0;
+
+            ChainSyncRequest() = default;
+
+            auto members() noexcept { return std::tie(requester_id, known_height, timestamp_ms); }
+            auto members() const noexcept { return std::tie(requester_id, known_height, timestamp_ms); }
+        };
+
+        struct ChainSyncResponse {
+            u64 chain_height = 0;        // Total chain height
+            u64 start_height = 0;        // Height of first event in this response
+            Vector<TrustEvent> events;   // Events from start_height onwards
+            u64 timestamp_ms = 0;
+
+            ChainSyncResponse() = default;
+
+            auto members() noexcept { return std::tie(chain_height, start_height, events, timestamp_ms); }
+            auto members() const noexcept { return std::tie(chain_height, start_height, events, timestamp_ms); }
         };
 
         // =============================================================================
@@ -214,6 +243,58 @@ namespace botlink {
                     }
                 }
 
+                return result::ok();
+            }
+
+            // Send chain sync request to a peer
+            auto send_chain_sync_request(const Endpoint &peer_endpoint) -> VoidRes {
+                if (trust_chain_ == nullptr) {
+                    return result::err(err::invalid("Trust chain not configured"));
+                }
+
+                ChainSyncRequest req;
+                req.requester_id = local_node_id_;
+                req.known_height = trust_chain_->length();
+                req.timestamp_ms = time::now_ms();
+
+                auto buf = dp::serialize<dp::Mode::WITH_VERSION>(req);
+                Vector<u8> payload;
+                for (const auto &b : buf) {
+                    payload.push_back(b);
+                }
+
+                // Use special control message type for chain sync
+                Envelope env = crypto::create_signed_envelope(
+                    static_cast<MsgType>(ControlMsgType::ChainSyncRequest), local_node_id_, local_ed25519_, payload);
+
+                auto serialized = crypto::serialize_envelope(env);
+                auto res = socket_->send_to(serialized, to_udp_endpoint(peer_endpoint));
+                if (res.is_err()) {
+                    return result::err(err::io("Failed to send chain sync request"));
+                }
+
+                echo::debug("ControlPlane: Sent chain sync request (local height: ", req.known_height, ")");
+                return result::ok();
+            }
+
+            // Send chain sync response to a peer
+            auto send_chain_sync_response(const ChainSyncResponse &response, const Endpoint &peer_endpoint) -> VoidRes {
+                auto buf = dp::serialize<dp::Mode::WITH_VERSION>(const_cast<ChainSyncResponse &>(response));
+                Vector<u8> payload;
+                for (const auto &b : buf) {
+                    payload.push_back(b);
+                }
+
+                Envelope env = crypto::create_signed_envelope(
+                    static_cast<MsgType>(ControlMsgType::ChainSyncResponse), local_node_id_, local_ed25519_, payload);
+
+                auto serialized = crypto::serialize_envelope(env);
+                auto res = socket_->send_to(serialized, to_udp_endpoint(peer_endpoint));
+                if (res.is_err()) {
+                    return result::err(err::io("Failed to send chain sync response"));
+                }
+
+                echo::debug("ControlPlane: Sent chain sync response (events: ", response.events.size(), ")");
                 return result::ok();
             }
 
@@ -393,6 +474,10 @@ namespace botlink {
                     return handle_membership_update(env);
                 case MsgType::EndpointAdvert:
                     return handle_endpoint_advert(env);
+                case static_cast<MsgType>(ControlMsgType::ChainSyncRequest):
+                    return handle_chain_sync_request(env, sender_ep);
+                case static_cast<MsgType>(ControlMsgType::ChainSyncResponse):
+                    return handle_chain_sync_response(env);
                 default:
                     return result::err(err::invalid("Unknown control message type"));
                 }
@@ -529,6 +614,97 @@ namespace botlink {
                 echo::debug("Received endpoint advertisement");
                 // TODO: Update peer endpoint cache
 
+                return result::ok();
+            }
+
+            auto handle_chain_sync_request(const Envelope &env, const Endpoint &sender_ep) -> VoidRes {
+                // Verify sender is approved member
+                if (trust_view_ != nullptr && !trust_view_->is_member(env.sender_id)) {
+                    return result::err(err::permission("Non-member cannot request chain sync"));
+                }
+
+                if (trust_chain_ == nullptr) {
+                    return result::err(err::invalid("Trust chain not configured"));
+                }
+
+                auto req_res = serial::deserialize<ChainSyncRequest>(env.payload);
+                if (req_res.is_err()) {
+                    return result::err(req_res.error());
+                }
+
+                const auto &req = req_res.value();
+                u64 local_height = trust_chain_->length();
+
+                echo::debug("ControlPlane: Received chain sync request (peer height: ", req.known_height,
+                            ", local height: ", local_height, ")");
+
+                // If peer is already up to date or ahead, nothing to send
+                if (req.known_height >= local_height) {
+                    echo::debug("ControlPlane: Peer already up to date");
+                    return result::ok();
+                }
+
+                // Build response with events the peer doesn't have
+                ChainSyncResponse response;
+                response.chain_height = local_height;
+                response.start_height = req.known_height;
+                response.timestamp_ms = time::now_ms();
+
+                // Get all events from chain and send those after peer's known height
+                auto all_events = trust_chain_->get_all_nodes_with_latest_event();
+                for (const auto &[node_id, evt] : all_events) {
+                    // Include events the peer might not have
+                    response.events.push_back(evt);
+                }
+
+                // Send response back to requester
+                return send_chain_sync_response(response, sender_ep);
+            }
+
+            auto handle_chain_sync_response(const Envelope &env) -> VoidRes {
+                // Verify sender is approved member
+                if (trust_view_ != nullptr && !trust_view_->is_member(env.sender_id)) {
+                    return result::err(err::permission("Non-member cannot send chain sync response"));
+                }
+
+                if (trust_chain_ == nullptr || trust_view_ == nullptr) {
+                    return result::err(err::invalid("Trust chain/view not configured"));
+                }
+
+                auto resp_res = serial::deserialize<ChainSyncResponse>(env.payload);
+                if (resp_res.is_err()) {
+                    return result::err(resp_res.error());
+                }
+
+                const auto &resp = resp_res.value();
+                echo::info("ControlPlane: Received chain sync response with ", resp.events.size(), " events");
+
+                // Process each event and update local state
+                for (const auto &evt : resp.events) {
+                    // Validate and add event to local chain
+                    auto add_res = trust_chain_->add_event(evt);
+                    if (add_res.is_err()) {
+                        echo::warn("ControlPlane: Failed to add synced event: ", add_res.error().message.c_str());
+                        continue;
+                    }
+
+                    // Update trust view based on event type
+                    if (evt.kind == TrustEventKind::JoinApproved) {
+                        MemberEntry entry;
+                        entry.node_id = evt.subject_id;
+                        entry.ed25519_pubkey = evt.subject_pubkey;
+                        entry.x25519_pubkey = evt.subject_x25519;
+                        entry.status = MemberStatus::Approved;
+                        entry.joined_at_ms = evt.timestamp_ms;
+                        trust_view_->add_member(entry);
+                        echo::info("ControlPlane: Synced new member from chain");
+                    } else if (evt.kind == TrustEventKind::MemberRevoked) {
+                        trust_view_->remove_member(evt.subject_id);
+                        echo::info("ControlPlane: Synced member revocation from chain");
+                    }
+                }
+
+                echo::info("ControlPlane: Chain sync complete (new height: ", trust_chain_->length(), ")");
                 return result::ok();
             }
         };
