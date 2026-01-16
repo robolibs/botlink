@@ -582,6 +582,9 @@ namespace botlink {
                 }
 
                 for (auto *peer : peer_table_->get_connected_peers()) {
+                    if (peer == nullptr) {
+                        continue;
+                    }
                     data_plane_->send_keepalive(peer->node_id);
                 }
             }
@@ -607,6 +610,9 @@ namespace botlink {
                 // Get connected peers and request sync from first available
                 auto connected = peer_table_->get_connected_peers();
                 for (auto *peer : connected) {
+                    if (peer == nullptr) {
+                        continue;
+                    }
                     auto ep = peer->preferred_endpoint();
                     if (ep.has_value()) {
                         auto res = control_plane_->send_chain_sync_request(ep.value());

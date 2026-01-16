@@ -287,23 +287,90 @@ namespace botlink {
                     entry.id = id.value();
                 }
 
+                // Parse and validate endpoint (required for all bootstrap entries)
+                boolean has_valid_endpoint = false;
                 auto endpoint_str = parser.get(section, "endpoint");
                 if (endpoint_str.has_value()) {
                     auto ep_res = net::parse_endpoint(endpoint_str.value());
                     if (ep_res.is_ok()) {
                         entry.endpoint = ep_res.value();
+                        has_valid_endpoint = true;
+                    } else {
+                        echo::warn("Bootstrap entry ", section.c_str(), ": invalid endpoint format");
                     }
                 }
 
+                // Parse and validate pubkey (required for member types)
+                boolean has_valid_pubkey = false;
                 auto pubkey_str = parser.get(section, "pubkey");
                 if (pubkey_str.has_value()) {
                     auto key_res = crypto::public_key_from_hex(pubkey_str.value());
                     if (key_res.is_ok()) {
                         entry.pubkey = key_res.value();
+                        has_valid_pubkey = true;
+                    } else {
+                        echo::warn("Bootstrap entry ", section.c_str(), ": invalid pubkey format");
                     }
                 }
 
+                // Validate required fields before adding entry
+                if (!has_valid_endpoint) {
+                    echo::warn("Bootstrap entry ", section.c_str(), " skipped: missing or invalid endpoint");
+                    continue;
+                }
+
+                // Members require a valid pubkey
+                if (entry.is_member() && !has_valid_pubkey) {
+                    echo::warn("Bootstrap entry ", section.c_str(), " skipped: member type requires valid pubkey");
+                    continue;
+                }
+
                 config.trust.bootstraps.push_back(entry);
+            }
+
+            // [timing] section
+            if (parser.has_section("timing")) {
+                auto envelope_max_age = parser.get("timing", "envelope_max_age_ms");
+                if (envelope_max_age.has_value()) {
+                    config.timing.envelope_max_age_ms = static_cast<u64>(std::atoll(envelope_max_age->c_str()));
+                }
+
+                auto envelope_max_future = parser.get("timing", "envelope_max_future_ms");
+                if (envelope_max_future.has_value()) {
+                    config.timing.envelope_max_future_ms = static_cast<u64>(std::atoll(envelope_max_future->c_str()));
+                }
+
+                auto handshake_timeout = parser.get("timing", "handshake_timeout_ms");
+                if (handshake_timeout.has_value()) {
+                    config.timing.handshake_timeout_ms = static_cast<u64>(std::atoll(handshake_timeout->c_str()));
+                }
+
+                auto keepalive_interval = parser.get("timing", "keepalive_interval_ms");
+                if (keepalive_interval.has_value()) {
+                    config.timing.keepalive_interval_ms = static_cast<u64>(std::atoll(keepalive_interval->c_str()));
+                }
+
+                auto session_lifetime = parser.get("timing", "session_lifetime_ms");
+                if (session_lifetime.has_value()) {
+                    config.timing.session_lifetime_ms = static_cast<u64>(std::atoll(session_lifetime->c_str()));
+                }
+
+                auto peer_timeout = parser.get("timing", "peer_timeout_ms");
+                if (peer_timeout.has_value()) {
+                    config.timing.peer_timeout_ms = static_cast<u64>(std::atoll(peer_timeout->c_str()));
+                }
+
+                auto sponsor_request_timeout = parser.get("timing", "sponsor_request_timeout_ms");
+                if (sponsor_request_timeout.has_value()) {
+                    config.timing.sponsor_request_timeout_ms =
+                        static_cast<u64>(std::atoll(sponsor_request_timeout->c_str()));
+                }
+
+                auto sponsor_max_request_age = parser.get("timing", "sponsor_max_request_age_ms");
+                if (sponsor_max_request_age.has_value()) {
+                    config.timing.sponsor_max_request_age_ms =
+                        static_cast<u64>(std::atoll(sponsor_max_request_age->c_str()));
+                }
             }
 
             // [logging] section
@@ -380,6 +447,28 @@ namespace botlink {
             ss << "id = \"genesis\"\n";
             ss << "endpoint = \"192.168.1.1:51820\"\n";
             ss << "pubkey = \"\"\n\n";
+
+            ss << "[timing]\n";
+            if (with_comments) {
+                ss << "# Timing configuration (all values in milliseconds)\n";
+                ss << "# Envelope validation - max age before considered stale\n";
+            }
+            ss << "envelope_max_age_ms = 60000\n";
+            if (with_comments)
+                ss << "# Max clock drift allowed for future timestamps\n";
+            ss << "envelope_max_future_ms = 5000\n";
+            if (with_comments)
+                ss << "# Handshake timeout\n";
+            ss << "handshake_timeout_ms = 5000\n";
+            if (with_comments)
+                ss << "# Keepalive interval\n";
+            ss << "keepalive_interval_ms = 25000\n";
+            if (with_comments)
+                ss << "# Session lifetime before rekey\n";
+            ss << "session_lifetime_ms = 180000\n";
+            if (with_comments)
+                ss << "# Peer timeout\n";
+            ss << "peer_timeout_ms = 120000\n\n";
 
             ss << "[logging]\n";
             if (with_comments)

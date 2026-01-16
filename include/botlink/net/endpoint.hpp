@@ -51,6 +51,27 @@ namespace botlink {
         }
 
         // =============================================================================
+        // IPv4 Parsing and Validation
+        // =============================================================================
+
+        // Parse IPv4 address string like "192.168.1.1" with proper octet range validation
+        // Returns error if any octet is > 255 or format is invalid
+        [[nodiscard]] inline auto parse_ipv4_addr(const String &addr_str) -> Res<IPv4Addr> {
+            std::string str(addr_str.c_str());
+            u32 a = 0, b = 0, c = 0, d = 0;
+            if (sscanf(str.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
+                return result::err(err::invalid("Invalid IPv4 address format"));
+            }
+
+            // Validate octet ranges (0-255)
+            if (a > 255 || b > 255 || c > 255 || d > 255) {
+                return result::err(err::invalid("IPv4 octet out of range (must be 0-255)"));
+            }
+
+            return result::ok(IPv4Addr(static_cast<u8>(a), static_cast<u8>(b), static_cast<u8>(c), static_cast<u8>(d)));
+        }
+
+        // =============================================================================
         // IPv6 Parsing and Formatting
         // =============================================================================
 
@@ -504,15 +525,12 @@ namespace botlink {
                     }
                     return result::ok(Endpoint(ipv6_res.value(), uri_res.value().port));
                 } else if (looks_like_ip_address(uri_res.value().host)) {
-                    // Parse IPv4 literal
-                    std::string host_str(uri_res.value().host.c_str());
-                    u32 a = 0, b = 0, c = 0, d = 0;
-                    if (sscanf(host_str.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
-                        return result::err(err::invalid("Invalid IPv4 address"));
+                    // Parse IPv4 literal with proper validation
+                    auto ipv4_res = parse_ipv4_addr(uri_res.value().host);
+                    if (ipv4_res.is_err()) {
+                        return result::err(ipv4_res.error());
                     }
-                    return result::ok(Endpoint(
-                        IPv4Addr(static_cast<u8>(a), static_cast<u8>(b), static_cast<u8>(c), static_cast<u8>(d)),
-                        uri_res.value().port));
+                    return result::ok(Endpoint(ipv4_res.value(), uri_res.value().port));
                 } else {
                     // DNS resolution for hostname (supports IPv4 and IPv6)
                     return resolve_hostname(uri_res.value().host, uri_res.value().port);
@@ -574,14 +592,12 @@ namespace botlink {
 
                 // Check if it's an IP address or hostname
                 if (looks_like_ip_address(addr_str)) {
-                    // Parse IPv4 literal
-                    u32 a = 0, b = 0, c = 0, d = 0;
-                    if (sscanf(addr_str.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
-                        return result::err(err::invalid("Invalid IPv4 address"));
+                    // Parse IPv4 literal with proper validation
+                    auto ipv4_res = parse_ipv4_addr(addr_str);
+                    if (ipv4_res.is_err()) {
+                        return result::err(ipv4_res.error());
                     }
-                    return result::ok(Endpoint(
-                        IPv4Addr(static_cast<u8>(a), static_cast<u8>(b), static_cast<u8>(c), static_cast<u8>(d)),
-                        port_res.value()));
+                    return result::ok(Endpoint(ipv4_res.value(), port_res.value()));
                 } else {
                     // DNS resolution for hostname (supports IPv4 and IPv6)
                     return resolve_hostname(addr_str, port_res.value());
