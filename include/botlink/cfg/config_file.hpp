@@ -378,7 +378,28 @@ namespace botlink {
                 config.logging.level = parser.get_or("logging", "level", "info");
             }
 
+            // Validate the parsed config and surface any errors early
+            auto validation_res = validate(config, ValidationMode::Lenient);
+            if (validation_res.is_err()) {
+                return result::err(validation_res.error());
+            }
+
             return result::ok(config);
+        }
+
+        // Load config from file with strict validation
+        [[nodiscard]] inline auto load_config_file_strict(const String &path) -> Res<Config> {
+            auto config_res = load_config_file(path);
+            if (config_res.is_err()) {
+                return config_res;
+            }
+
+            auto validation_res = validate(config_res.value(), ValidationMode::Strict);
+            if (validation_res.is_err()) {
+                return result::err(validation_res.error());
+            }
+
+            return config_res;
         }
 
         // =============================================================================

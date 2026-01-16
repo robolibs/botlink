@@ -250,7 +250,15 @@ namespace botlink {
 
     namespace cfg {
 
-        [[nodiscard]] inline auto validate(const Config &config) -> VoidRes {
+        // Strict validation mode - all fields required
+        enum class ValidationMode : u8 {
+            Strict = 0,  // All fields required (for runtime)
+            Lenient = 1, // Allow incomplete config (for initial setup/testing)
+        };
+
+        [[nodiscard]] inline auto validate(const Config &config,
+                                            ValidationMode mode = ValidationMode::Strict) -> VoidRes {
+            // Core validation - always required
             if (config.version != 1) {
                 return result::err(err::config("Unsupported config version"));
             }
@@ -263,18 +271,24 @@ namespace botlink {
                 return result::err(err::config("Interface name is required"));
             }
 
-            if (!config.node.overlay.is_valid()) {
-                return result::err(err::config("Invalid overlay configuration"));
+            // Strict mode additional checks
+            if (mode == ValidationMode::Strict) {
+                if (!config.node.overlay.is_valid()) {
+                    return result::err(err::config("Invalid overlay configuration"));
+                }
+
+                if (!config.identity.is_valid()) {
+                    return result::err(err::config("Invalid identity configuration"));
+                }
+
+                // Bootstrap peers not required for genesis nodes (they create the first network)
+                // But still required in strict mode by default
+                if (config.trust.bootstraps.empty() && config.node.role != Role::Genesis) {
+                    return result::err(err::config("At least one bootstrap peer is required for non-genesis nodes"));
+                }
             }
 
-            if (!config.identity.is_valid()) {
-                return result::err(err::config("Invalid identity configuration"));
-            }
-
-            if (config.trust.bootstraps.empty()) {
-                return result::err(err::config("At least one bootstrap peer is required"));
-            }
-
+            // Policy validation - always check if set
             if (config.trust.policy.min_yes_votes == 0) {
                 return result::err(err::config("min_yes_votes must be at least 1"));
             }
@@ -282,7 +296,19 @@ namespace botlink {
             return result::ok();
         }
 
+        // Convenience function for strict validation
+        [[nodiscard]] inline auto validate_strict(const Config &config) -> VoidRes {
+            return validate(config, ValidationMode::Strict);
+        }
+
+        // Convenience function for lenient validation (for default config, testing)
+        [[nodiscard]] inline auto validate_lenient(const Config &config) -> VoidRes {
+            return validate(config, ValidationMode::Lenient);
+        }
+
         // Create a minimal default config
+        // Note: This config passes lenient validation but may need additional
+        // configuration (overlay, identity, bootstraps) for strict validation
         [[nodiscard]] inline auto default_config() -> Config {
             Config config;
             config.version = 1;
@@ -290,6 +316,8 @@ namespace botlink {
             config.node.role = Role::Member;
             config.node.interface = InterfaceName("botlink0");
             config.node.mtu = DEFAULT_MTU;
+            config.trust.policy.min_yes_votes = 2; // Reasonable default for voting
+            config.trust.policy.vote_timeout_ms = 15000;
             config.logging.level = "info";
             return config;
         }

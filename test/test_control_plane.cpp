@@ -77,7 +77,7 @@ TEST_SUITE("ControlPlane - Message Structures") {
         auto [x_priv, x_pub] = crypto::generate_x25519_keypair();
         NodeId node_id = crypto::node_id_from_pubkey(ed_pub);
 
-        MemberEntry entry;
+        net::MemberSnapshotEntry entry;
         entry.node_id = node_id;
         entry.ed25519_pubkey = ed_pub;
         entry.x25519_pubkey = x_pub;

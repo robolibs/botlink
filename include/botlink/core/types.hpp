@@ -99,8 +99,9 @@ namespace botlink {
     // =============================================================================
 
     enum class Role : u8 {
-        Member = 0, // Full participant: can vote, introduce, tunnel
-        Relay = 1,  // Forwarder only: cannot vote, cannot introduce
+        Member = 0,  // Full participant: can vote, introduce, tunnel
+        Relay = 1,   // Forwarder only: cannot vote, cannot introduce
+        Genesis = 2, // Network founder: creates initial trust chain, doesn't need bootstrap peers
     };
 
     [[nodiscard]] inline auto role_to_string(Role role) -> const char * {
@@ -109,6 +110,8 @@ namespace botlink {
             return "member";
         case Role::Relay:
             return "relay";
+        case Role::Genesis:
+            return "genesis";
         default:
             return "unknown";
         }

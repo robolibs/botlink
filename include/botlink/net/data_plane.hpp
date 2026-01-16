@@ -15,6 +15,7 @@
 #include <botlink/crypto/kdf.hpp>
 #include <botlink/net/endpoint.hpp>
 #include <botlink/net/transport.hpp>
+#include <botlink/netdev/netdev.hpp>
 #include <botlink/runtime/peer_table.hpp>
 #include <botlink/trust/trust_view.hpp>
 #include <datapod/datapod.hpp>
@@ -159,6 +160,7 @@ namespace botlink {
             TrustView *trust_view_;
             PeerTable *peer_table_;
             UdpSocket *socket_;
+            netdev::NetdevBackend *netdev_ = nullptr; // For writing decrypted packets to TUN interface
 
             Map<NodeId, HandshakeSession> handshakes_;
             u64 handshake_timeout_ms_ = 5000;
@@ -176,6 +178,17 @@ namespace botlink {
                       TrustView *trust_view, PeerTable *peer_table, UdpSocket *socket)
                 : local_node_id_(local_id), local_x25519_(x25519_priv), local_x25519_pub_(x25519_pub),
                   trust_view_(trust_view), peer_table_(peer_table), socket_(socket) {}
+
+            // Set netdev backend for writing decrypted packets
+            auto set_netdev(netdev::NetdevBackend *netdev) -> void { netdev_ = netdev; }
+
+            // =============================================================================
+            // Timing Configuration
+            // =============================================================================
+
+            auto set_handshake_timeout_ms(u64 ms) -> void { handshake_timeout_ms_ = ms; }
+            auto set_keepalive_interval_ms(u64 ms) -> void { keepalive_interval_ms_ = ms; }
+            auto set_rekey_interval_ms(u64 ms) -> void { rekey_interval_ms_ = ms; }
 
             // =============================================================================
             // Rate Limiting Configuration
@@ -710,7 +723,17 @@ namespace botlink {
                     if (res.is_err()) {
                         return result::err(res.error());
                     }
-                    // Data was decrypted - caller should process it
+                    // Write decrypted packet to netdev (TUN interface)
+                    if (netdev_ != nullptr && netdev_->can_write()) {
+                        netdev::IpPacket pkt(res.value());
+                        auto write_res = netdev_->write_packet(pkt);
+                        if (write_res.is_err()) {
+                            echo::warn("DataPlane: Failed to write packet to netdev: ",
+                                       write_res.error().message.c_str());
+                            return result::err(write_res.error());
+                        }
+                        metrics::inc_packets_to_netdev();
+                    }
                     return result::ok();
                 }
                 case DataMsgType::Keepalive:
