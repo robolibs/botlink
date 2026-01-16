@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.0.6] - 2026-01-16
+
+### <!-- 0 -->⛰️  Features
+
+- Improve code readability and formatting
+- Introduce keygen tool and IPv6 support
+
+### <!-- 7 -->⚙️ Miscellaneous Tasks
+
+- Remove version constants within code
+
 ## [0.0.5] - 2026-01-16
 
 ### <!-- 0 -->⛰️  Features
