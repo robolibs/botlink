@@ -66,12 +66,6 @@
 
 namespace botlink {
 
-    // Library version
-    inline constexpr u32 VERSION_MAJOR = 0;
-    inline constexpr u32 VERSION_MINOR = 0;
-    inline constexpr u32 VERSION_PATCH = 3;
-    inline constexpr const char *VERSION_STRING = "0.0.3";
-
     // Initialize libsodium (call once at startup)
     inline auto init() -> VoidRes {
         if (sodium_init() < 0) {

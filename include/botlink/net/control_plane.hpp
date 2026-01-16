@@ -87,8 +87,29 @@ namespace botlink {
             auto members() const noexcept { return std::tie(requester_id, known_height, timestamp_ms); }
         };
 
+        // Simplified member entry for wire serialization (avoids nested Vector<Endpoint>)
+        struct MemberSnapshotEntry {
+            NodeId node_id;
+            PublicKey ed25519_pubkey;
+            PublicKey x25519_pubkey;
+            MemberStatus status = MemberStatus::Unconfigured;
+            u64 joined_at_ms = 0;
+
+            MemberSnapshotEntry() = default;
+
+            // Construct from MemberEntry
+            explicit MemberSnapshotEntry(const MemberEntry &entry)
+                : node_id(entry.node_id), ed25519_pubkey(entry.ed25519_pubkey), x25519_pubkey(entry.x25519_pubkey),
+                  status(entry.status), joined_at_ms(entry.joined_at_ms) {}
+
+            auto members() noexcept { return std::tie(node_id, ed25519_pubkey, x25519_pubkey, status, joined_at_ms); }
+            auto members() const noexcept {
+                return std::tie(node_id, ed25519_pubkey, x25519_pubkey, status, joined_at_ms);
+            }
+        };
+
         struct MembershipSnapshotResponse {
-            Vector<MemberEntry> member_entries;
+            Vector<MemberSnapshotEntry> member_entries;
             u64 chain_height = 0;
             u64 timestamp_ms = 0;
 
@@ -545,12 +566,16 @@ namespace botlink {
                 switch (env.msg_type) {
                 case MsgType::JoinRequest:
                     return handle_join_request(env, sender_ep);
+                case MsgType::JoinProposal:
+                    return handle_join_proposal(env);
                 case MsgType::VoteCast:
                     return handle_vote_cast(env);
                 case MsgType::MembershipUpdate:
                     return handle_membership_update(env);
                 case MsgType::EndpointAdvert:
                     return handle_endpoint_advert(env);
+                case static_cast<MsgType>(ControlMsgType::MembershipSnapshot):
+                    return handle_membership_snapshot_request(env, sender_ep);
                 case static_cast<MsgType>(ControlMsgType::ChainSyncRequest):
                     return handle_chain_sync_request(env, sender_ep);
                 case static_cast<MsgType>(ControlMsgType::ChainSyncResponse):
@@ -758,6 +783,133 @@ namespace botlink {
 
                 echo::debug("ControlPlane: Stored endpoint advertisement for peer (", advert.endpoints.size(),
                             " endpoints)");
+
+                return result::ok();
+            }
+
+            // Handle incoming JoinProposal from another member
+            auto handle_join_proposal(const Envelope &env) -> VoidRes {
+                // Verify sender is approved member (only members can propose)
+                if (trust_view_ != nullptr && !trust_view_->is_member(env.sender_id)) {
+                    return result::err(err::permission("Non-member cannot propose new members"));
+                }
+
+                if (voting_ == nullptr) {
+                    return result::err(err::invalid("Voting not configured"));
+                }
+
+                // Deserialize the join proposal
+                auto proposal_res = serial::deserialize<JoinProposal>(env.payload);
+                if (proposal_res.is_err()) {
+                    return result::err(proposal_res.error());
+                }
+
+                const auto &proposal = proposal_res.value();
+
+                // Validate proposal fields
+                if (proposal.candidate_id.data.empty()) {
+                    return result::err(err::invalid("Proposal missing candidate_id"));
+                }
+
+                if (proposal.candidate_ed25519.is_zero()) {
+                    return result::err(err::invalid("Proposal missing candidate Ed25519 key"));
+                }
+
+                // Check if candidate is already a member
+                if (trust_view_ != nullptr && trust_view_->is_member(proposal.candidate_id)) {
+                    return result::err(err::invalid("Candidate is already a member"));
+                }
+
+                // Check if we already have a pending proposal for this candidate
+                if (voting_->has_proposal(proposal.candidate_id)) {
+                    echo::debug("ControlPlane: Already have proposal for this candidate");
+                    return result::ok();
+                }
+
+                // Add proposal to voting manager
+                auto add_res = voting_->add_proposal(proposal);
+                if (add_res.is_err()) {
+                    return result::err(add_res.error());
+                }
+
+                // Record proposal in trust chain
+                if (trust_chain_ != nullptr) {
+                    auto chain_res = trust_chain_->propose_join(proposal);
+                    if (chain_res.is_err()) {
+                        echo::warn("ControlPlane: Failed to record proposal in chain: ",
+                                   chain_res.error().message.c_str());
+                    }
+                }
+
+                echo::info("ControlPlane: Received and recorded join proposal for new candidate");
+                return result::ok();
+            }
+
+            // Handle membership snapshot request
+            auto handle_membership_snapshot_request(const Envelope &env, const Endpoint &sender_ep) -> VoidRes {
+                // Verify sender is approved member or pending candidate
+                if (trust_view_ == nullptr) {
+                    return result::err(err::invalid("Trust view not configured"));
+                }
+
+                // Allow requests from both members and pending candidates (for bootstrap)
+                boolean is_member = trust_view_->is_member(env.sender_id);
+                boolean is_pending = voting_ != nullptr && voting_->has_proposal(env.sender_id);
+
+                if (!is_member && !is_pending) {
+                    // Allow from unknown for initial sync bootstrap
+                    echo::debug("ControlPlane: Allowing membership snapshot request from unknown node for bootstrap");
+                }
+
+                auto req_res = serial::deserialize<MembershipSnapshotRequest>(env.payload);
+                if (req_res.is_err()) {
+                    return result::err(req_res.error());
+                }
+
+                const auto &req = req_res.value();
+
+                // Build snapshot response with current membership
+                MembershipSnapshotResponse response;
+                response.timestamp_ms = time::now_ms();
+
+                if (trust_chain_ != nullptr) {
+                    response.chain_height = trust_chain_->length();
+                }
+
+                // Get all current members from trust view
+                auto members = trust_view_->get_all_members();
+                for (const auto &member : members) {
+                    response.member_entries.push_back(MemberSnapshotEntry(member));
+                }
+
+                echo::debug("ControlPlane: Sending membership snapshot with ", response.member_entries.size(),
+                            " members");
+
+                // Send response
+                return send_membership_snapshot_response(response, sender_ep);
+            }
+
+            // Send membership snapshot response
+            auto send_membership_snapshot_response(MembershipSnapshotResponse &response, const Endpoint &peer_ep)
+                -> VoidRes {
+                if (socket_ == nullptr) {
+                    return result::err(err::invalid("Socket not configured"));
+                }
+
+                auto buf = serial::serialize(response);
+                Vector<u8> payload;
+                for (const auto &b : buf) {
+                    payload.push_back(b);
+                }
+
+                Envelope env = crypto::create_signed_envelope(static_cast<MsgType>(ControlMsgType::MembershipSnapshot),
+                                                              local_node_id_, local_ed25519_, payload);
+
+                auto serialized = crypto::serialize_envelope(env);
+                auto res = socket_->send_to(serialized, to_udp_endpoint(peer_ep));
+                if (res.is_err()) {
+                    return result::err(err::io("Failed to send membership snapshot response"));
+                }
 
                 return result::ok();
             }

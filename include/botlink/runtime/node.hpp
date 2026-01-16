@@ -122,11 +122,13 @@ namespace botlink {
             Optional<net::RelayManager> relay_manager_;
             Optional<netdev::RouteTable> route_table_;
             Optional<Scheduler> scheduler_;
+            Optional<net::ControlPlane> control_plane_owned_;
+            Optional<net::DataPlane> data_plane_owned_;
 
-            // Components (not owned, for extensibility)
+            // Components (not owned, for extensibility - if set, overrides owned instances)
             netdev::NetdevBackend *netdev_ = nullptr;
-            net::ControlPlane *control_plane_ = nullptr;
-            net::DataPlane *data_plane_ = nullptr;
+            net::ControlPlane *control_plane_ext_ = nullptr;
+            net::DataPlane *data_plane_ext_ = nullptr;
 
             // Event loop control
             boolean running_ = false;
@@ -176,8 +178,9 @@ namespace botlink {
                 // Initialize trust view
                 trust_view_.emplace(config_.trust.policy.min_yes_votes, config_.trust.policy.vote_timeout_ms);
 
-                // Initialize peer table
-                peer_table_.emplace(25000, 120000, 180000); // keepalive, handshake timeout, session lifetime
+                // Initialize peer table with timing config values
+                peer_table_.emplace(config_.timing.keepalive_interval_ms, config_.timing.peer_timeout_ms,
+                                    config_.timing.session_lifetime_ms);
 
                 // Initialize transport
                 if (!config_.node.overlay.listen.empty()) {
@@ -193,7 +196,8 @@ namespace botlink {
 
                 // Initialize sponsor (if member)
                 if (config_.node.is_member()) {
-                    sponsor_.emplace(local_node_id_, config_.identity.ed25519_private, 60000, 10);
+                    sponsor_.emplace(local_node_id_, config_.identity.ed25519_private,
+                                     config_.timing.sponsor_request_timeout_ms, 10);
                 }
 
                 // Initialize voting
@@ -220,6 +224,37 @@ namespace botlink {
 
                 // Initialize route table
                 route_table_.emplace(config_.node.overlay.addr);
+
+                // Initialize ControlPlane if not externally set
+                if (control_plane_ext_ == nullptr && socket_.has_value() && trust_view_.has_value()) {
+                    control_plane_owned_.emplace(local_node_id_, config_.identity.ed25519_private,
+                                                 config_.identity.ed25519_public,
+                                                 trust_view_.has_value() ? &trust_view_.value() : nullptr,
+                                                 trust_chain_.has_value() ? &trust_chain_.value() : nullptr,
+                                                 sponsor_.has_value() ? &sponsor_.value() : nullptr,
+                                                 voting_.has_value() ? &voting_.value() : nullptr, &socket_.value());
+                    // Apply timing config
+                    control_plane_owned_->set_max_envelope_age_ms(config_.timing.envelope_max_age_ms);
+                    echo::info("BotlinkNode: Created owned ControlPlane");
+                }
+
+                // Initialize DataPlane if not externally set
+                if (data_plane_ext_ == nullptr && socket_.has_value() && trust_view_.has_value() &&
+                    peer_table_.has_value()) {
+                    data_plane_owned_.emplace(
+                        local_node_id_, config_.identity.x25519_private, config_.identity.x25519_public,
+                        trust_view_.has_value() ? &trust_view_.value() : nullptr,
+                        peer_table_.has_value() ? &peer_table_.value() : nullptr, &socket_.value());
+                    // Apply timing config
+                    data_plane_owned_->set_handshake_timeout_ms(config_.timing.handshake_timeout_ms);
+                    data_plane_owned_->set_keepalive_interval_ms(config_.timing.keepalive_interval_ms);
+                    data_plane_owned_->set_rekey_interval_ms(config_.timing.session_lifetime_ms);
+                    // Wire netdev if available
+                    if (netdev_ != nullptr) {
+                        data_plane_owned_->set_netdev(netdev_);
+                    }
+                    echo::info("BotlinkNode: Created owned DataPlane");
+                }
 
                 // Initialize scheduler
                 scheduler_.emplace();
@@ -342,8 +377,9 @@ namespace botlink {
                 }
 
                 // Initiate handshake via data plane
-                if (data_plane_ != nullptr) {
-                    return data_plane_->initiate_handshake(peer_id, ep);
+                auto *dp = data_plane();
+                if (dp != nullptr) {
+                    return dp->initiate_handshake(peer_id, ep);
                 }
 
                 echo::info("BotlinkNode: Initiated connection to peer");
@@ -351,12 +387,12 @@ namespace botlink {
             }
 
             // =============================================================================
-            // Setters (for external components)
+            // Setters (for external components - override owned instances)
             // =============================================================================
 
             auto set_netdev(netdev::NetdevBackend *netdev) -> void { netdev_ = netdev; }
-            auto set_control_plane(net::ControlPlane *cp) -> void { control_plane_ = cp; }
-            auto set_data_plane(net::DataPlane *dp) -> void { data_plane_ = dp; }
+            auto set_control_plane(net::ControlPlane *cp) -> void { control_plane_ext_ = cp; }
+            auto set_data_plane(net::DataPlane *dp) -> void { data_plane_ext_ = dp; }
 
             // =============================================================================
             // Getters
@@ -376,6 +412,22 @@ namespace botlink {
             }
             [[nodiscard]] auto scheduler() -> Scheduler * {
                 return scheduler_.has_value() ? &scheduler_.value() : nullptr;
+            }
+
+            // Get control plane (external override takes precedence)
+            [[nodiscard]] auto control_plane() -> net::ControlPlane * {
+                if (control_plane_ext_ != nullptr) {
+                    return control_plane_ext_;
+                }
+                return control_plane_owned_.has_value() ? &control_plane_owned_.value() : nullptr;
+            }
+
+            // Get data plane (external override takes precedence)
+            [[nodiscard]] auto data_plane() -> net::DataPlane * {
+                if (data_plane_ext_ != nullptr) {
+                    return data_plane_ext_;
+                }
+                return data_plane_owned_.has_value() ? &data_plane_owned_.value() : nullptr;
             }
 
           private:
@@ -404,17 +456,23 @@ namespace botlink {
                     return;
                 }
 
-                // Keepalive timer
-                scheduler_->create_repeating(timer_names::KEEPALIVE, 25000, [this]() { send_keepalives(); });
+                // Keepalive timer - uses timing config
+                scheduler_->create_repeating(timer_names::KEEPALIVE, config_.timing.keepalive_interval_ms,
+                                             [this]() { send_keepalives(); });
 
-                // Peer cleanup timer
-                scheduler_->create_repeating(timer_names::PEER_CLEANUP, 60000, [this]() { cleanup_peers(); });
+                // Peer cleanup timer - run at half the peer timeout interval
+                u64 cleanup_interval = config_.timing.peer_timeout_ms / 2;
+                scheduler_->create_repeating(timer_names::PEER_CLEANUP, cleanup_interval,
+                                             [this]() { cleanup_peers(); });
 
-                // Trust sync timer
-                scheduler_->create_repeating(timer_names::TRUST_SYNC, 30000, [this]() { sync_trust(); });
+                // Trust sync timer - run at 1/6 of peer timeout (30s if peer timeout is 180s)
+                u64 sync_interval = config_.timing.peer_timeout_ms / 6;
+                scheduler_->create_repeating(timer_names::TRUST_SYNC, sync_interval, [this]() { sync_trust(); });
 
-                // Vote timeout processing
-                scheduler_->create_repeating(timer_names::VOTE_TIMEOUT, 5000, [this]() { process_vote_timeouts(); });
+                // Vote timeout processing - run at 1/3 of vote timeout
+                u64 vote_check_interval = config_.trust.policy.vote_timeout_ms / 3;
+                scheduler_->create_repeating(timer_names::VOTE_TIMEOUT, vote_check_interval,
+                                             [this]() { process_vote_timeouts(); });
             }
 
             auto connect_to_bootstraps() -> void {
@@ -504,8 +562,9 @@ namespace botlink {
                 }
 
                 // Delegate to control plane handler
-                if (control_plane_ != nullptr) {
-                    auto res = control_plane_->handle_envelope(env, member->ed25519_pubkey, sender_ep);
+                auto *cp = control_plane();
+                if (cp != nullptr) {
+                    auto res = cp->handle_envelope(env, member->ed25519_pubkey, sender_ep);
                     if (res.is_err()) {
                         echo::warn("BotlinkNode: Control plane error: ", res.error().message.c_str());
                     }
@@ -527,8 +586,9 @@ namespace botlink {
             }
 
             auto dispatch_data_packet(const Vector<u8> &data, const Endpoint &sender_ep) -> void {
-                if (data_plane_ != nullptr) {
-                    auto res = data_plane_->handle_packet(data, sender_ep);
+                auto *dp = data_plane();
+                if (dp != nullptr) {
+                    auto res = dp->handle_packet(data, sender_ep);
                     if (res.is_err()) {
                         echo::warn("BotlinkNode: Data plane error: ", res.error().message.c_str());
                     }
@@ -558,8 +618,9 @@ namespace botlink {
                             auto peer = peer_table_->get_peer(route->next_hop);
                             if (peer.has_value() && (*peer)->has_session()) {
                                 // Send encrypted data via data plane
-                                if (data_plane_ != nullptr) {
-                                    auto res = data_plane_->send_data(route->next_hop, pkt.data);
+                                auto *dp = data_plane();
+                                if (dp != nullptr) {
+                                    auto res = dp->send_data(route->next_hop, pkt.data);
                                     if (res.is_ok()) {
                                         stats_.packets_sent++;
                                         stats_.bytes_sent += pkt.data.size();
@@ -577,7 +638,8 @@ namespace botlink {
             }
 
             auto send_keepalives() -> void {
-                if (!peer_table_.has_value() || data_plane_ == nullptr) {
+                auto *dp = data_plane();
+                if (!peer_table_.has_value() || dp == nullptr) {
                     return;
                 }
 
@@ -585,7 +647,7 @@ namespace botlink {
                     if (peer == nullptr) {
                         continue;
                     }
-                    data_plane_->send_keepalive(peer->node_id);
+                    dp->send_keepalive(peer->node_id);
                 }
             }
 
@@ -603,7 +665,8 @@ namespace botlink {
 
             auto sync_trust() -> void {
                 // Request chain sync from connected peers
-                if (!peer_table_.has_value() || control_plane_ == nullptr) {
+                auto *cp = control_plane();
+                if (!peer_table_.has_value() || cp == nullptr) {
                     return;
                 }
 
@@ -615,7 +678,7 @@ namespace botlink {
                     }
                     auto ep = peer->preferred_endpoint();
                     if (ep.has_value()) {
-                        auto res = control_plane_->send_chain_sync_request(ep.value());
+                        auto res = cp->send_chain_sync_request(ep.value());
                         if (res.is_ok()) {
                             echo::debug("BotlinkNode: Requested chain sync from peer");
                             break; // Only need to sync from one peer

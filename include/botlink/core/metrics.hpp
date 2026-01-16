@@ -64,6 +64,10 @@ namespace botlink {
             std::atomic<u64> relay_packets_forwarded{0};
             std::atomic<u64> relay_packets_received{0};
 
+            // Netdev metrics
+            std::atomic<u64> packets_to_netdev{0};
+            std::atomic<u64> packets_from_netdev{0};
+
             // Error metrics
             std::atomic<u64> crypto_errors{0};
             std::atomic<u64> envelope_validation_failures{0};
@@ -109,6 +113,9 @@ namespace botlink {
                 relay_routes_established.store(0);
                 relay_packets_forwarded.store(0);
                 relay_packets_received.store(0);
+
+                packets_to_netdev.store(0);
+                packets_from_netdev.store(0);
 
                 crypto_errors.store(0);
                 envelope_validation_failures.store(0);
@@ -172,6 +179,10 @@ namespace botlink {
         inline void inc_relay_routes_established() { global().relay_routes_established.fetch_add(1); }
         inline void inc_relay_packets_forwarded() { global().relay_packets_forwarded.fetch_add(1); }
         inline void inc_relay_packets_received() { global().relay_packets_received.fetch_add(1); }
+
+        // Netdev
+        inline void inc_packets_to_netdev() { global().packets_to_netdev.fetch_add(1); }
+        inline void inc_packets_from_netdev() { global().packets_from_netdev.fetch_add(1); }
 
         // Errors
         inline void inc_crypto_errors() { global().crypto_errors.fetch_add(1); }

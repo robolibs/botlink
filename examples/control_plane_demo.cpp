@@ -138,7 +138,7 @@ int main() {
     auto [m1_priv, m1_pub] = bl::crypto::generate_ed25519_keypair();
     auto [m1_x_priv, m1_x_pub] = bl::crypto::generate_x25519_keypair();
 
-    bl::MemberEntry entry1;
+    bl::net::MemberSnapshotEntry entry1;
     entry1.node_id = bl::crypto::node_id_from_pubkey(m1_pub);
     entry1.ed25519_pubkey = m1_pub;
     entry1.x25519_pubkey = m1_x_pub;
@@ -149,7 +149,7 @@ int main() {
     auto [m2_priv, m2_pub] = bl::crypto::generate_ed25519_keypair();
     auto [m2_x_priv, m2_x_pub] = bl::crypto::generate_x25519_keypair();
 
-    bl::MemberEntry entry2;
+    bl::net::MemberSnapshotEntry entry2;
     entry2.node_id = bl::crypto::node_id_from_pubkey(m2_pub);
     entry2.ed25519_pubkey = m2_pub;
     entry2.x25519_pubkey = m2_x_pub;
