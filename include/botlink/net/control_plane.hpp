@@ -229,6 +229,7 @@ namespace botlink {
             }
 
             // Send vote cast to peers
+            // Returns error if ALL sends fail, otherwise returns ok with warning for partial failures
             auto send_vote(const VoteCastEvent &vote, const Vector<Endpoint> &peer_endpoints) -> VoidRes {
                 TrustEvent evt = vote.to_event();
                 Vector<u8> payload = trust::serialize_event(evt);
@@ -238,17 +239,26 @@ namespace botlink {
 
                 auto serialized = crypto::serialize_envelope(env);
 
+                usize success_count = 0;
+                usize fail_count = 0;
                 for (const auto &ep : peer_endpoints) {
                     auto res = socket_->send_to(serialized, to_udp_endpoint(ep));
                     if (res.is_err()) {
+                        ++fail_count;
                         echo::warn("Failed to send vote to peer");
+                    } else {
+                        ++success_count;
                     }
                 }
 
+                if (success_count == 0 && fail_count > 0) {
+                    return result::err(err::io("Failed to send vote to any peer"));
+                }
                 return result::ok();
             }
 
             // Send membership update to peers
+            // Returns error if ALL sends fail, otherwise returns ok with warning for partial failures
             auto send_membership_update(const MembershipUpdate &update, const Vector<Endpoint> &peer_endpoints)
                 -> VoidRes {
                 auto buf = dp::serialize<dp::Mode::WITH_VERSION>(const_cast<MembershipUpdate &>(update));
@@ -262,17 +272,26 @@ namespace botlink {
 
                 auto serialized = crypto::serialize_envelope(env);
 
+                usize success_count = 0;
+                usize fail_count = 0;
                 for (const auto &ep : peer_endpoints) {
                     auto res = socket_->send_to(serialized, to_udp_endpoint(ep));
                     if (res.is_err()) {
+                        ++fail_count;
                         echo::warn("Failed to send membership update to peer");
+                    } else {
+                        ++success_count;
                     }
                 }
 
+                if (success_count == 0 && fail_count > 0) {
+                    return result::err(err::io("Failed to send membership update to any peer"));
+                }
                 return result::ok();
             }
 
             // Send endpoint advertisement
+            // Returns error if ALL sends fail, otherwise returns ok with warning for partial failures
             auto send_endpoint_advert(const EndpointAdvert &advert, const Vector<Endpoint> &peer_endpoints) -> VoidRes {
                 auto buf = dp::serialize<dp::Mode::WITH_VERSION>(const_cast<EndpointAdvert &>(advert));
                 Vector<u8> payload;
@@ -285,13 +304,21 @@ namespace botlink {
 
                 auto serialized = crypto::serialize_envelope(env);
 
+                usize success_count = 0;
+                usize fail_count = 0;
                 for (const auto &ep : peer_endpoints) {
                     auto res = socket_->send_to(serialized, to_udp_endpoint(ep));
                     if (res.is_err()) {
+                        ++fail_count;
                         echo::warn("Failed to send endpoint advert to peer");
+                    } else {
+                        ++success_count;
                     }
                 }
 
+                if (success_count == 0 && fail_count > 0) {
+                    return result::err(err::io("Failed to send endpoint advert to any peer"));
+                }
                 return result::ok();
             }
 
@@ -416,6 +443,7 @@ namespace botlink {
                 auto chain_res = trust_chain_->record_decision(decision);
                 if (chain_res.is_err()) {
                     echo::warn("Failed to record decision to chain: ", chain_res.error().message.c_str());
+                    return result::err(err::io("Failed to record decision to trust chain"));
                 }
 
                 // Update trust view

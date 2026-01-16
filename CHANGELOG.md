@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.0.5] - 2026-01-16
+
+### <!-- 0 -->⛰️  Features
+
+- Implement core network rate limiting and comprehensive testing
+
+### <!-- 6 -->🧪 Testing
+
+- Add new examples and a lot of new unit tests
+- Add comprehensive tests for many modules
+
 ## [0.0.4] - 2026-01-15
 
 ### <!-- 0 -->⛰️  Features

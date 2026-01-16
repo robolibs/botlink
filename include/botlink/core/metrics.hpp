@@ -33,6 +33,7 @@ namespace botlink {
             std::atomic<u64> packets_dropped_invalid{0};
             std::atomic<u64> packets_dropped_no_session{0};
             std::atomic<u64> packets_dropped_decrypt_fail{0};
+            std::atomic<u64> packets_dropped_rate_limit{0};
 
             // Byte counters
             std::atomic<u64> bytes_sent{0};
@@ -83,6 +84,7 @@ namespace botlink {
                 packets_dropped_invalid.store(0);
                 packets_dropped_no_session.store(0);
                 packets_dropped_decrypt_fail.store(0);
+                packets_dropped_rate_limit.store(0);
 
                 bytes_sent.store(0);
                 bytes_received.store(0);
@@ -140,6 +142,7 @@ namespace botlink {
         inline void inc_packets_dropped_invalid() { global().packets_dropped_invalid.fetch_add(1); }
         inline void inc_packets_dropped_no_session() { global().packets_dropped_no_session.fetch_add(1); }
         inline void inc_packets_dropped_decrypt_fail() { global().packets_dropped_decrypt_fail.fetch_add(1); }
+        inline void inc_packets_dropped_rate_limit() { global().packets_dropped_rate_limit.fetch_add(1); }
 
         // Bytes
         inline void add_bytes_sent(u64 n) { global().bytes_sent.fetch_add(n); }

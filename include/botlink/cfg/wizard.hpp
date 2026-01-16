@@ -116,7 +116,11 @@ namespace botlink {
 
                 try {
                     return static_cast<u32>(std::stoul(input));
-                } catch (...) {
+                } catch (const std::invalid_argument &) {
+                    echo::warn("Invalid number format, using default: ", default_val);
+                    return default_val;
+                } catch (const std::out_of_range &) {
+                    echo::warn("Number out of range, using default: ", default_val);
                     return default_val;
                 }
             }
@@ -150,7 +154,11 @@ namespace botlink {
                     if (choice < choices.size()) {
                         return choice;
                     }
-                } catch (...) {
+                    echo::warn("Choice out of range, using default");
+                } catch (const std::invalid_argument &) {
+                    echo::warn("Invalid choice format, using default");
+                } catch (const std::out_of_range &) {
+                    echo::warn("Choice number out of range, using default");
                 }
                 return default_idx;
             }

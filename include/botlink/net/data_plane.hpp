@@ -139,6 +139,18 @@ namespace botlink {
         // Data Plane Handler
         // =============================================================================
 
+        // =============================================================================
+        // Rate Limit Entry - Per-peer packet rate limiting for DoS protection
+        // =============================================================================
+
+        struct RateLimitEntry {
+            u64 window_start_ms = 0;
+            u32 packet_count = 0;
+            u32 handshake_count = 0;
+
+            RateLimitEntry() = default;
+        };
+
         class DataPlane {
           private:
             NodeId local_node_id_;
@@ -153,6 +165,12 @@ namespace botlink {
             u64 keepalive_interval_ms_ = 25000;
             u64 rekey_interval_ms_ = 120000;
 
+            // Rate limiting for DoS protection
+            Map<NodeId, RateLimitEntry> rate_limits_;
+            u64 rate_limit_window_ms_ = 1000;   // 1 second window
+            u32 max_packets_per_window_ = 100;  // Max packets per second per peer
+            u32 max_handshakes_per_window_ = 5; // Max handshake initiations per second per peer
+
           public:
             DataPlane(const NodeId &local_id, const PrivateKey &x25519_priv, const PublicKey &x25519_pub,
                       TrustView *trust_view, PeerTable *peer_table, UdpSocket *socket)
@@ -160,11 +178,89 @@ namespace botlink {
                   trust_view_(trust_view), peer_table_(peer_table), socket_(socket) {}
 
             // =============================================================================
+            // Rate Limiting Configuration
+            // =============================================================================
+
+            auto set_rate_limit_window_ms(u64 ms) -> void { rate_limit_window_ms_ = ms; }
+            auto set_max_packets_per_window(u32 max) -> void { max_packets_per_window_ = max; }
+            auto set_max_handshakes_per_window(u32 max) -> void { max_handshakes_per_window_ = max; }
+
+            // Check if a peer is rate limited for general packets
+            // Returns true if packet should be allowed, false if rate limited
+            [[nodiscard]] auto check_rate_limit(const NodeId &peer_id) -> boolean {
+                u64 now = time::now_ms();
+                auto &entry = rate_limits_[peer_id];
+
+                // Reset window if expired
+                if (now - entry.window_start_ms >= rate_limit_window_ms_) {
+                    entry.window_start_ms = now;
+                    entry.packet_count = 0;
+                    entry.handshake_count = 0;
+                }
+
+                // Check packet limit
+                if (entry.packet_count >= max_packets_per_window_) {
+                    metrics::inc_packets_dropped_rate_limit();
+                    return false;
+                }
+
+                ++entry.packet_count;
+                return true;
+            }
+
+            // Check if a peer is rate limited for handshake initiations
+            // Returns true if handshake should be allowed, false if rate limited
+            [[nodiscard]] auto check_handshake_rate_limit(const NodeId &peer_id) -> boolean {
+                u64 now = time::now_ms();
+                auto &entry = rate_limits_[peer_id];
+
+                // Reset window if expired
+                if (now - entry.window_start_ms >= rate_limit_window_ms_) {
+                    entry.window_start_ms = now;
+                    entry.packet_count = 0;
+                    entry.handshake_count = 0;
+                }
+
+                // Check handshake limit (stricter than general packets)
+                if (entry.handshake_count >= max_handshakes_per_window_) {
+                    metrics::inc_packets_dropped_rate_limit();
+                    return false;
+                }
+
+                ++entry.handshake_count;
+                ++entry.packet_count;
+                return true;
+            }
+
+            // Clean up stale rate limit entries (call periodically)
+            auto cleanup_stale_rate_limits() -> usize {
+                Vector<NodeId> to_remove;
+                u64 now = time::now_ms();
+                u64 stale_threshold = rate_limit_window_ms_ * 10; // 10 windows old
+
+                for (const auto &[node_id, entry] : rate_limits_) {
+                    if (now - entry.window_start_ms > stale_threshold) {
+                        to_remove.push_back(node_id);
+                    }
+                }
+
+                for (const auto &id : to_remove) {
+                    rate_limits_.erase(id);
+                }
+                return to_remove.size();
+            }
+
+            // =============================================================================
             // Handshake Initiation
             // =============================================================================
 
             // Initiate handshake with a peer
             auto initiate_handshake(const NodeId &peer_id, const Endpoint &peer_ep) -> VoidRes {
+                // Validate required pointers
+                if (peer_table_ == nullptr || socket_ == nullptr) {
+                    return result::err(err::invalid("DataPlane not properly configured"));
+                }
+
                 // Check if peer is approved
                 if (trust_view_ != nullptr && !trust_view_->is_member(peer_id)) {
                     return result::err(err::permission("Peer is not an approved member"));
@@ -226,6 +322,11 @@ namespace botlink {
             // =============================================================================
 
             auto handle_handshake_init(const Vector<u8> &data, const Endpoint &sender_ep) -> VoidRes {
+                // Validate required pointers
+                if (socket_ == nullptr) {
+                    return result::err(err::invalid("DataPlane not properly configured"));
+                }
+
                 if (data.size() < 2) {
                     return result::err(err::invalid("Data too short"));
                 }
@@ -235,6 +336,12 @@ namespace botlink {
                     return result::err(init_res.error());
                 }
                 const auto &init = init_res.value();
+
+                // Rate limit check for handshake initiations (DoS protection)
+                if (!check_handshake_rate_limit(init.initiator_id)) {
+                    echo::warn("DataPlane: Handshake rate limit exceeded for peer");
+                    return result::err(err::permission("Handshake rate limit exceeded"));
+                }
 
                 // Check if initiator is approved
                 if (trust_view_ != nullptr && !trust_view_->is_member(init.initiator_id)) {
@@ -296,7 +403,11 @@ namespace botlink {
                     payload.push_back(b);
                 }
 
-                socket_->send_to(payload, to_udp_endpoint(sender_ep));
+                auto send_res = socket_->send_to(payload, to_udp_endpoint(sender_ep));
+                if (send_res.is_err()) {
+                    echo::warn("DataPlane: Failed to send handshake response");
+                    return result::err(err::io("Failed to send handshake response"));
+                }
 
                 metrics::inc_handshakes_completed();
                 metrics::inc_sessions_created();
@@ -361,6 +472,11 @@ namespace botlink {
 
             // Send encrypted data packet to peer
             auto send_data(const NodeId &peer_id, const Vector<u8> &data) -> VoidRes {
+                // Validate required pointers
+                if (peer_table_ == nullptr || socket_ == nullptr) {
+                    return result::err(err::invalid("DataPlane not properly configured"));
+                }
+
                 auto peer = peer_table_->get_peer(peer_id);
                 if (!peer.has_value()) {
                     return result::err(err::not_found("Peer not found"));
@@ -413,6 +529,11 @@ namespace botlink {
 
             // Handle incoming data packet
             auto handle_data_packet(const Vector<u8> &data, const Endpoint &sender_ep) -> Res<Vector<u8>> {
+                // Validate required pointers
+                if (peer_table_ == nullptr) {
+                    return result::err(err::invalid("DataPlane not properly configured"));
+                }
+
                 auto pkt_res = crypto::deserialize_data_packet(data);
                 if (pkt_res.is_err()) {
                     return result::err(pkt_res.error());
@@ -422,6 +543,9 @@ namespace botlink {
 
                 // Find peer by key_id
                 for (auto *peer : peer_table_->get_connected_peers()) {
+                    if (peer == nullptr) {
+                        continue;
+                    }
                     if (!peer->has_session()) {
                         continue;
                     }
@@ -465,6 +589,11 @@ namespace botlink {
             // =============================================================================
 
             auto send_keepalive(const NodeId &peer_id) -> VoidRes {
+                // Validate required pointers
+                if (peer_table_ == nullptr || socket_ == nullptr) {
+                    return result::err(err::invalid("DataPlane not properly configured"));
+                }
+
                 auto peer = peer_table_->get_peer(peer_id);
                 if (!peer.has_value()) {
                     return result::err(err::not_found("Peer not found"));
@@ -505,6 +634,11 @@ namespace botlink {
 
             // Initiate rekey with a peer
             auto send_rekey(const NodeId &peer_id) -> VoidRes {
+                // Validate required pointers
+                if (peer_table_ == nullptr || socket_ == nullptr) {
+                    return result::err(err::invalid("DataPlane not properly configured"));
+                }
+
                 auto peer = peer_table_->get_peer(peer_id);
                 if (!peer.has_value()) {
                     return result::err(err::not_found("Peer not found"));
@@ -592,6 +726,11 @@ namespace botlink {
           private:
             // Handle incoming rekey request
             auto handle_rekey(const Vector<u8> &data, const Endpoint &sender_ep) -> VoidRes {
+                // Validate required pointers
+                if (peer_table_ == nullptr || socket_ == nullptr) {
+                    return result::err(err::invalid("DataPlane not properly configured"));
+                }
+
                 if (data.size() < 2) {
                     return result::err(err::invalid("Rekey data too short"));
                 }
@@ -648,7 +787,11 @@ namespace botlink {
                     payload.push_back(b);
                 }
 
-                socket_->send_to(payload, to_udp_endpoint(sender_ep));
+                auto send_res = socket_->send_to(payload, to_udp_endpoint(sender_ep));
+                if (send_res.is_err()) {
+                    echo::warn("DataPlane: Failed to send rekey response");
+                    return result::err(err::io("Failed to send rekey response"));
+                }
 
                 metrics::inc_handshakes_completed();
                 echo::info("DataPlane: Completed rekey as responder");

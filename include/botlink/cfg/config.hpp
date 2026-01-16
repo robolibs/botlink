@@ -156,6 +156,37 @@ namespace botlink {
     };
 
     // =============================================================================
+    // Timing Config - Configurable timeouts and intervals
+    // =============================================================================
+
+    struct TimingConfig {
+        // Envelope validation
+        u64 envelope_max_age_ms = 60000;   // Max age for envelope timestamps (default 60s)
+        u64 envelope_max_future_ms = 5000; // Max future drift for envelope timestamps (default 5s)
+
+        // Session management
+        u64 handshake_timeout_ms = 5000;   // Handshake timeout (default 5s)
+        u64 keepalive_interval_ms = 25000; // Keepalive interval (default 25s)
+        u64 session_lifetime_ms = 180000;  // Session lifetime before rekey (default 3min)
+        u64 peer_timeout_ms = 120000;      // Peer timeout (default 2min)
+
+        // Sponsor/voting
+        u64 sponsor_request_timeout_ms = 60000;  // Sponsor request timeout (default 60s)
+        u64 sponsor_max_request_age_ms = 300000; // Max sponsor request age (default 5min)
+
+        auto members() noexcept {
+            return std::tie(envelope_max_age_ms, envelope_max_future_ms, handshake_timeout_ms, keepalive_interval_ms,
+                            session_lifetime_ms, peer_timeout_ms, sponsor_request_timeout_ms,
+                            sponsor_max_request_age_ms);
+        }
+        auto members() const noexcept {
+            return std::tie(envelope_max_age_ms, envelope_max_future_ms, handshake_timeout_ms, keepalive_interval_ms,
+                            session_lifetime_ms, peer_timeout_ms, sponsor_request_timeout_ms,
+                            sponsor_max_request_age_ms);
+        }
+    };
+
+    // =============================================================================
     // Logging Config
     // =============================================================================
 
@@ -192,6 +223,7 @@ namespace botlink {
         IdentityConfig identity;
         TrustConfig trust;
         RelayConfig relays;
+        TimingConfig timing;
         LoggingConfig logging;
 
         [[nodiscard]] auto is_valid() const -> boolean {
@@ -208,8 +240,8 @@ namespace botlink {
             return true;
         }
 
-        auto members() noexcept { return std::tie(version, node, identity, trust, relays, logging); }
-        auto members() const noexcept { return std::tie(version, node, identity, trust, relays, logging); }
+        auto members() noexcept { return std::tie(version, node, identity, trust, relays, timing, logging); }
+        auto members() const noexcept { return std::tie(version, node, identity, trust, relays, timing, logging); }
     };
 
     // =============================================================================
