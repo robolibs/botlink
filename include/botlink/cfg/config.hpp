@@ -256,8 +256,8 @@ namespace botlink {
             Lenient = 1, // Allow incomplete config (for initial setup/testing)
         };
 
-        [[nodiscard]] inline auto validate(const Config &config,
-                                            ValidationMode mode = ValidationMode::Strict) -> VoidRes {
+        [[nodiscard]] inline auto validate(const Config &config, ValidationMode mode = ValidationMode::Strict)
+            -> VoidRes {
             // Core validation - always required
             if (config.version != 1) {
                 return result::err(err::config("Unsupported config version"));

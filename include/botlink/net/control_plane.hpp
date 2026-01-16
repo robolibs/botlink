@@ -99,8 +99,8 @@ namespace botlink {
 
             // Construct from MemberEntry
             explicit MemberSnapshotEntry(const MemberEntry &entry)
-                : node_id(entry.node_id), ed25519_pubkey(entry.ed25519_pubkey),
-                  x25519_pubkey(entry.x25519_pubkey), status(entry.status), joined_at_ms(entry.joined_at_ms) {}
+                : node_id(entry.node_id), ed25519_pubkey(entry.ed25519_pubkey), x25519_pubkey(entry.x25519_pubkey),
+                  status(entry.status), joined_at_ms(entry.joined_at_ms) {}
 
             auto members() noexcept { return std::tie(node_id, ed25519_pubkey, x25519_pubkey, status, joined_at_ms); }
             auto members() const noexcept {

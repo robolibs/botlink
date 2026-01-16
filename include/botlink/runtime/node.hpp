@@ -228,11 +228,11 @@ namespace botlink {
                 // Initialize ControlPlane if not externally set
                 if (control_plane_ext_ == nullptr && socket_.has_value() && trust_view_.has_value()) {
                     control_plane_owned_.emplace(local_node_id_, config_.identity.ed25519_private,
-                                                  config_.identity.ed25519_public,
-                                                  trust_view_.has_value() ? &trust_view_.value() : nullptr,
-                                                  trust_chain_.has_value() ? &trust_chain_.value() : nullptr,
-                                                  sponsor_.has_value() ? &sponsor_.value() : nullptr,
-                                                  voting_.has_value() ? &voting_.value() : nullptr, &socket_.value());
+                                                 config_.identity.ed25519_public,
+                                                 trust_view_.has_value() ? &trust_view_.value() : nullptr,
+                                                 trust_chain_.has_value() ? &trust_chain_.value() : nullptr,
+                                                 sponsor_.has_value() ? &sponsor_.value() : nullptr,
+                                                 voting_.has_value() ? &voting_.value() : nullptr, &socket_.value());
                     // Apply timing config
                     control_plane_owned_->set_max_envelope_age_ms(config_.timing.envelope_max_age_ms);
                     echo::info("BotlinkNode: Created owned ControlPlane");
@@ -241,11 +241,10 @@ namespace botlink {
                 // Initialize DataPlane if not externally set
                 if (data_plane_ext_ == nullptr && socket_.has_value() && trust_view_.has_value() &&
                     peer_table_.has_value()) {
-                    data_plane_owned_.emplace(local_node_id_, config_.identity.x25519_private,
-                                               config_.identity.x25519_public,
-                                               trust_view_.has_value() ? &trust_view_.value() : nullptr,
-                                               peer_table_.has_value() ? &peer_table_.value() : nullptr,
-                                               &socket_.value());
+                    data_plane_owned_.emplace(
+                        local_node_id_, config_.identity.x25519_private, config_.identity.x25519_public,
+                        trust_view_.has_value() ? &trust_view_.value() : nullptr,
+                        peer_table_.has_value() ? &peer_table_.value() : nullptr, &socket_.value());
                     // Apply timing config
                     data_plane_owned_->set_handshake_timeout_ms(config_.timing.handshake_timeout_ms);
                     data_plane_owned_->set_keepalive_interval_ms(config_.timing.keepalive_interval_ms);
@@ -463,7 +462,8 @@ namespace botlink {
 
                 // Peer cleanup timer - run at half the peer timeout interval
                 u64 cleanup_interval = config_.timing.peer_timeout_ms / 2;
-                scheduler_->create_repeating(timer_names::PEER_CLEANUP, cleanup_interval, [this]() { cleanup_peers(); });
+                scheduler_->create_repeating(timer_names::PEER_CLEANUP, cleanup_interval,
+                                             [this]() { cleanup_peers(); });
 
                 // Trust sync timer - run at 1/6 of peer timeout (30s if peer timeout is 180s)
                 u64 sync_interval = config_.timing.peer_timeout_ms / 6;
