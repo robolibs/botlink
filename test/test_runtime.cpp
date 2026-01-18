@@ -66,8 +66,8 @@ TEST_SUITE("Runtime - PeerTable") {
         table.add_peer(node_id, ed_pub, x_pub);
 
         crypto::SessionKey send_key, recv_key;
-        auto r1 = keylock::utils::Common::generate_random_bytes(32);
-        auto r2 = keylock::utils::Common::generate_random_bytes(32);
+        auto r1 = keylock::crypto::Common::generate_random_bytes(32);
+        auto r2 = keylock::crypto::Common::generate_random_bytes(32);
         for (usize i = 0; i < 32; ++i) {
             send_key.data[i] = r1[i];
             recv_key.data[i] = r2[i];
@@ -120,8 +120,8 @@ TEST_SUITE("Runtime - PeerTable") {
 
         // Connect only one
         crypto::SessionKey send_key, recv_key;
-        auto r1 = keylock::utils::Common::generate_random_bytes(32);
-        auto r2 = keylock::utils::Common::generate_random_bytes(32);
+        auto r1 = keylock::crypto::Common::generate_random_bytes(32);
+        auto r2 = keylock::crypto::Common::generate_random_bytes(32);
         for (usize i = 0; i < 32; ++i) {
             send_key.data[i] = r1[i];
             recv_key.data[i] = r2[i];
@@ -148,8 +148,8 @@ TEST_SUITE("Runtime - PeerTable") {
 
         // After creating session, status should change
         crypto::SessionKey send_key, recv_key;
-        auto r1 = keylock::utils::Common::generate_random_bytes(32);
-        auto r2 = keylock::utils::Common::generate_random_bytes(32);
+        auto r1 = keylock::crypto::Common::generate_random_bytes(32);
+        auto r2 = keylock::crypto::Common::generate_random_bytes(32);
         for (usize i = 0; i < 32; ++i) {
             send_key.data[i] = r1[i];
             recv_key.data[i] = r2[i];

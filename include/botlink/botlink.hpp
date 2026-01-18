@@ -66,13 +66,8 @@
 
 namespace botlink {
 
-    // Initialize libsodium (call once at startup)
-    inline auto init() -> VoidRes {
-        if (sodium_init() < 0) {
-            return result::err(err::crypto("Failed to initialize libsodium"));
-        }
-        return result::ok();
-    }
+    // Initialize crypto (keylock doesn't require initialization)
+    inline auto init() -> VoidRes { return result::ok(); }
 
 } // namespace botlink
 

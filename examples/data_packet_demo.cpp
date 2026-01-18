@@ -23,7 +23,7 @@ int main() {
     std::cout << "1. Creating session key...\n";
 
     crypto::SessionKey key;
-    auto random = keylock::utils::Common::generate_random_bytes(32);
+    auto random = keylock::crypto::Common::generate_random_bytes(32);
     for (usize i = 0; i < 32; ++i) {
         key.data[i] = random[i];
     }
@@ -190,7 +190,7 @@ int main() {
     std::cout << "8. Wrong key detection...\n";
 
     crypto::SessionKey wrong_key;
-    auto wrong_random = keylock::utils::Common::generate_random_bytes(32);
+    auto wrong_random = keylock::crypto::Common::generate_random_bytes(32);
     for (usize i = 0; i < 32; ++i) {
         wrong_key.data[i] = wrong_random[i];
     }

@@ -392,7 +392,7 @@ TEST_SUITE("Crypto - KDF") {
 
     TEST_CASE("Rekey produces different key") {
         crypto::SessionKey key;
-        auto random = keylock::utils::Common::generate_random_bytes(32);
+        auto random = keylock::crypto::Common::generate_random_bytes(32);
         for (usize i = 0; i < 32; ++i) {
             key.data[i] = random[i];
         }
@@ -419,7 +419,7 @@ TEST_SUITE("Crypto - AEAD") {
 
     TEST_CASE("AEAD encrypt and decrypt") {
         crypto::SessionKey key;
-        auto random = keylock::utils::Common::generate_random_bytes(32);
+        auto random = keylock::crypto::Common::generate_random_bytes(32);
         for (usize i = 0; i < 32; ++i) {
             key.data[i] = random[i];
         }
@@ -445,8 +445,8 @@ TEST_SUITE("Crypto - AEAD") {
 
     TEST_CASE("AEAD fails with wrong key") {
         crypto::SessionKey key1, key2;
-        auto r1 = keylock::utils::Common::generate_random_bytes(32);
-        auto r2 = keylock::utils::Common::generate_random_bytes(32);
+        auto r1 = keylock::crypto::Common::generate_random_bytes(32);
+        auto r2 = keylock::crypto::Common::generate_random_bytes(32);
         for (usize i = 0; i < 32; ++i) {
             key1.data[i] = r1[i];
             key2.data[i] = r2[i];
@@ -465,7 +465,7 @@ TEST_SUITE("Crypto - AEAD") {
 
     TEST_CASE("AEAD fails with wrong nonce") {
         crypto::SessionKey key;
-        auto random = keylock::utils::Common::generate_random_bytes(32);
+        auto random = keylock::crypto::Common::generate_random_bytes(32);
         for (usize i = 0; i < 32; ++i) {
             key.data[i] = random[i];
         }
@@ -485,7 +485,7 @@ TEST_SUITE("Crypto - AEAD") {
 
     TEST_CASE("Data packet encrypt and decrypt") {
         crypto::SessionKey key;
-        auto random = keylock::utils::Common::generate_random_bytes(32);
+        auto random = keylock::crypto::Common::generate_random_bytes(32);
         for (usize i = 0; i < 32; ++i) {
             key.data[i] = random[i];
         }

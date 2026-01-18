@@ -10,9 +10,8 @@
 #include <botlink/core/types.hpp>
 #include <botlink/crypto/kdf.hpp>
 #include <datapod/datapod.hpp>
+#include <keylock/crypto/aead_xchacha20poly1305_ietf/aead.hpp>
 #include <keylock/keylock.hpp>
-
-#include <sodium.h>
 
 namespace botlink {
 
@@ -24,7 +23,7 @@ namespace botlink {
         // Constants
         // =============================================================================
 
-        inline constexpr usize TAG_SIZE = crypto_aead_xchacha20poly1305_ietf_ABYTES; // 16 bytes
+        inline constexpr usize TAG_SIZE = keylock::crypto::aead_xchacha20poly1305::ABYTES; // 16 bytes
 
         // =============================================================================
         // AEAD Encryption
@@ -39,9 +38,9 @@ namespace botlink {
 
             unsigned long long ciphertext_len;
 
-            int result =
-                crypto_aead_xchacha20poly1305_ietf_encrypt(ciphertext.data(), &ciphertext_len, plaintext, plaintext_len,
-                                                           ad, ad_len, nullptr, nonce.raw(), key.raw());
+            int result = keylock::crypto::aead_xchacha20poly1305::encrypt(ciphertext.data(), &ciphertext_len, plaintext,
+                                                                          plaintext_len, ad, ad_len, nullptr,
+                                                                          nonce.raw(), key.raw());
 
             if (result != 0) {
                 return result::err(err::crypto("AEAD encryption failed"));
@@ -76,8 +75,8 @@ namespace botlink {
             unsigned long long plaintext_len;
 
             int result =
-                crypto_aead_xchacha20poly1305_ietf_decrypt(plaintext.data(), &plaintext_len, nullptr, ciphertext,
-                                                           ciphertext_len, ad, ad_len, nonce.raw(), key.raw());
+                keylock::crypto::aead_xchacha20poly1305::decrypt(plaintext.data(), &plaintext_len, nullptr, ciphertext,
+                                                                 ciphertext_len, ad, ad_len, nonce.raw(), key.raw());
 
             if (result != 0) {
                 return result::err(err::crypto("AEAD decryption failed (authentication)"));

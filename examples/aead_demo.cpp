@@ -20,7 +20,7 @@ int main() {
     std::cout << "1. Generating session key...\n";
 
     crypto::SessionKey key;
-    auto random_bytes = keylock::utils::Common::generate_random_bytes(crypto::SESSION_KEY_SIZE);
+    auto random_bytes = keylock::crypto::Common::generate_random_bytes(crypto::SESSION_KEY_SIZE);
     for (usize i = 0; i < crypto::SESSION_KEY_SIZE; ++i) {
         key.data[i] = random_bytes[i];
     }
@@ -82,7 +82,7 @@ int main() {
     std::cout << "4. Demonstrating authentication failure with wrong key...\n";
 
     crypto::SessionKey wrong_key;
-    auto wrong_random = keylock::utils::Common::generate_random_bytes(crypto::SESSION_KEY_SIZE);
+    auto wrong_random = keylock::crypto::Common::generate_random_bytes(crypto::SESSION_KEY_SIZE);
     for (usize i = 0; i < crypto::SESSION_KEY_SIZE; ++i) {
         wrong_key.data[i] = wrong_random[i];
     }

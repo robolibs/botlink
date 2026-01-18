@@ -106,7 +106,7 @@ void test_aead() {
 
     // Create session key
     crypto::SessionKey key;
-    auto random = keylock::utils::Common::generate_random_bytes(32);
+    auto random = keylock::crypto::Common::generate_random_bytes(32);
     for (usize i = 0; i < 32; ++i) {
         key.data[i] = random[i];
     }
@@ -222,8 +222,8 @@ void test_peer_table() {
 
     // Create a session
     crypto::SessionKey send_key, recv_key;
-    auto rnd1 = keylock::utils::Common::generate_random_bytes(32);
-    auto rnd2 = keylock::utils::Common::generate_random_bytes(32);
+    auto rnd1 = keylock::crypto::Common::generate_random_bytes(32);
+    auto rnd2 = keylock::crypto::Common::generate_random_bytes(32);
     for (usize i = 0; i < 32; ++i) {
         send_key.data[i] = rnd1[i];
         recv_key.data[i] = rnd2[i];
