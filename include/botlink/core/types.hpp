@@ -192,6 +192,9 @@ namespace botlink {
         VoteCast = 0x03,
         MembershipUpdate = 0x04,
         EndpointAdvert = 0x05,
+        MembershipSnapshot = 0x06,
+        ChainSyncRequest = 0x07,
+        ChainSyncResponse = 0x08,
 
         // Relay control
         RelayConnect = 0x10,

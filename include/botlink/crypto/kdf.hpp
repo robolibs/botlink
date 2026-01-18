@@ -10,9 +10,8 @@
 #include <botlink/core/types.hpp>
 #include <botlink/crypto/identity.hpp>
 #include <datapod/datapod.hpp>
+#include <keylock/hash/hmac/hmac_sha256.hpp>
 #include <keylock/keylock.hpp>
-
-#include <sodium.h>
 
 namespace botlink {
 
@@ -82,7 +81,7 @@ namespace botlink {
             ~SessionKey() { clear(); }
 
             auto clear() -> void {
-                keylock::utils::Common::secure_clear(data.data(), data.size());
+                keylock::crypto::Common::secure_clear(data.data(), data.size());
                 key_id = 0;
             }
 
@@ -135,10 +134,10 @@ namespace botlink {
             Array<u8, HANDSHAKE_HASH_SIZE> prk{};
 
             // HMAC-SHA256(salt, ikm)
-            crypto_auth_hmacsha256_state state;
-            crypto_auth_hmacsha256_init(&state, salt, salt_len);
-            crypto_auth_hmacsha256_update(&state, ikm, ikm_len);
-            crypto_auth_hmacsha256_final(&state, prk.data());
+            keylock::hash::hmac_sha256::Context state;
+            keylock::hash::hmac_sha256::init(&state, salt, salt_len);
+            keylock::hash::hmac_sha256::update(&state, ikm, ikm_len);
+            keylock::hash::hmac_sha256::final(&state, prk.data());
 
             return prk;
         }
@@ -153,16 +152,16 @@ namespace botlink {
             u8 counter = 1;
 
             while (output.size() < output_len) {
-                crypto_auth_hmacsha256_state state;
-                crypto_auth_hmacsha256_init(&state, prk.data(), prk.size());
+                keylock::hash::hmac_sha256::Context state;
+                keylock::hash::hmac_sha256::init(&state, prk.data(), prk.size());
 
                 if (counter > 1) {
-                    crypto_auth_hmacsha256_update(&state, t.data(), t.size());
+                    keylock::hash::hmac_sha256::update(&state, t.data(), t.size());
                 }
 
-                crypto_auth_hmacsha256_update(&state, info, info_len);
-                crypto_auth_hmacsha256_update(&state, &counter, 1);
-                crypto_auth_hmacsha256_final(&state, t.data());
+                keylock::hash::hmac_sha256::update(&state, info, info_len);
+                keylock::hash::hmac_sha256::update(&state, &counter, 1);
+                keylock::hash::hmac_sha256::final(&state, t.data());
 
                 for (usize i = 0; i < t.size() && output.size() < output_len; ++i) {
                     output.push_back(t[i]);
@@ -218,7 +217,7 @@ namespace botlink {
             }
 
             // Secure clear
-            keylock::utils::Common::secure_clear(derived.data(), derived.size());
+            keylock::crypto::Common::secure_clear(derived.data(), derived.size());
 
             return {send_key, recv_key};
         }
@@ -255,7 +254,7 @@ namespace botlink {
                 new_key.data[i] = derived[i];
             }
 
-            keylock::utils::Common::secure_clear(derived.data(), derived.size());
+            keylock::crypto::Common::secure_clear(derived.data(), derived.size());
 
             return new_key;
         }
@@ -267,11 +266,11 @@ namespace botlink {
         // Generate random nonce
         inline auto generate_nonce() -> Nonce {
             Nonce nonce;
-            auto random = keylock::utils::Common::generate_random_bytes(NONCE_SIZE);
+            auto random = keylock::crypto::Common::generate_random_bytes(NONCE_SIZE);
             for (usize i = 0; i < NONCE_SIZE; ++i) {
                 nonce.data[i] = random[i];
             }
-            keylock::utils::Common::secure_clear(random.data(), random.size());
+            keylock::crypto::Common::secure_clear(random.data(), random.size());
             return nonce;
         }
 
@@ -291,7 +290,7 @@ namespace botlink {
 
         // Generate a random key ID
         inline auto generate_key_id() -> u32 {
-            auto random = keylock::utils::Common::generate_random_bytes(4);
+            auto random = keylock::crypto::Common::generate_random_bytes(4);
             u32 id = static_cast<u32>(random[0]) | (static_cast<u32>(random[1]) << 8) |
                      (static_cast<u32>(random[2]) << 16) | (static_cast<u32>(random[3]) << 24);
             return id;

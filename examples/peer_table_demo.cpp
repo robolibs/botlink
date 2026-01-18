@@ -98,8 +98,8 @@ int main() {
 
     // Simulate key exchange result
     crypto::SessionKey send_key, recv_key;
-    auto rand1 = keylock::utils::Common::generate_random_bytes(32);
-    auto rand2 = keylock::utils::Common::generate_random_bytes(32);
+    auto rand1 = keylock::crypto::Common::generate_random_bytes(32);
+    auto rand2 = keylock::crypto::Common::generate_random_bytes(32);
     for (usize i = 0; i < 32; ++i) {
         send_key.data[i] = rand1[i];
         recv_key.data[i] = rand2[i];

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.0.7] - 2026-01-18
+
+### <!-- 7 -->⚙️ Miscellaneous Tasks
+
+- Migrate to CMake for project configuration
+
 ## [0.0.6] - 2026-01-16
 
 ### <!-- 0 -->⛰️  Features

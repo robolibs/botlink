@@ -805,17 +805,17 @@ namespace wg {
 
         // Generate random preshared key using keylock (libsodium)
         inline auto generate_preshared(Key &key) -> void {
-            auto random_bytes = keylock::utils::Common::generate_random_bytes(KEY_SIZE);
+            auto random_bytes = keylock::crypto::Common::generate_random_bytes(KEY_SIZE);
             std::memcpy(key.raw(), random_bytes.data(), KEY_SIZE);
-            keylock::utils::Common::secure_clear(random_bytes.data(), random_bytes.size());
+            keylock::crypto::Common::secure_clear(random_bytes.data(), random_bytes.size());
         }
 
         // Generate Curve25519 private key using keylock (libsodium)
         inline auto generate_private(Key &private_key) -> void {
             // Use libsodium's secure random generation via keylock
-            auto random_bytes = keylock::utils::Common::generate_random_bytes(KEY_SIZE);
+            auto random_bytes = keylock::crypto::Common::generate_random_bytes(KEY_SIZE);
             std::memcpy(private_key.raw(), random_bytes.data(), KEY_SIZE);
-            keylock::utils::Common::secure_clear(random_bytes.data(), random_bytes.size());
+            keylock::crypto::Common::secure_clear(random_bytes.data(), random_bytes.size());
 
             // Clamp for Curve25519 (WireGuard format)
             private_key.data[0] &= 248;
@@ -856,8 +856,8 @@ namespace wg {
             }
 
             // Secure clear the original keypair
-            keylock::utils::Common::secure_clear(keypair.private_key.data(), keypair.private_key.size());
-            keylock::utils::Common::secure_clear(keypair.public_key.data(), keypair.public_key.size());
+            keylock::crypto::Common::secure_clear(keypair.private_key.data(), keypair.private_key.size());
+            keylock::crypto::Common::secure_clear(keypair.public_key.data(), keypair.public_key.size());
 
             return {private_key, public_key};
         }

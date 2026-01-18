@@ -361,8 +361,8 @@ namespace botlink {
                 }
 
                 // Use special control message type for chain sync
-                Envelope env = crypto::create_signed_envelope(static_cast<MsgType>(ControlMsgType::ChainSyncRequest),
-                                                              local_node_id_, local_ed25519_, payload);
+                Envelope env =
+                    crypto::create_signed_envelope(MsgType::ChainSyncRequest, local_node_id_, local_ed25519_, payload);
 
                 auto serialized = crypto::serialize_envelope(env);
                 auto res = socket_->send_to(serialized, to_udp_endpoint(peer_endpoint));
@@ -382,8 +382,8 @@ namespace botlink {
                     payload.push_back(b);
                 }
 
-                Envelope env = crypto::create_signed_envelope(static_cast<MsgType>(ControlMsgType::ChainSyncResponse),
-                                                              local_node_id_, local_ed25519_, payload);
+                Envelope env =
+                    crypto::create_signed_envelope(MsgType::ChainSyncResponse, local_node_id_, local_ed25519_, payload);
 
                 auto serialized = crypto::serialize_envelope(env);
                 auto res = socket_->send_to(serialized, to_udp_endpoint(peer_endpoint));
@@ -574,11 +574,11 @@ namespace botlink {
                     return handle_membership_update(env);
                 case MsgType::EndpointAdvert:
                     return handle_endpoint_advert(env);
-                case static_cast<MsgType>(ControlMsgType::MembershipSnapshot):
+                case MsgType::MembershipSnapshot:
                     return handle_membership_snapshot_request(env, sender_ep);
-                case static_cast<MsgType>(ControlMsgType::ChainSyncRequest):
+                case MsgType::ChainSyncRequest:
                     return handle_chain_sync_request(env, sender_ep);
-                case static_cast<MsgType>(ControlMsgType::ChainSyncResponse):
+                case MsgType::ChainSyncResponse:
                     return handle_chain_sync_response(env);
                 default:
                     return result::err(err::invalid("Unknown control message type"));
@@ -902,8 +902,8 @@ namespace botlink {
                     payload.push_back(b);
                 }
 
-                Envelope env = crypto::create_signed_envelope(static_cast<MsgType>(ControlMsgType::MembershipSnapshot),
-                                                              local_node_id_, local_ed25519_, payload);
+                Envelope env = crypto::create_signed_envelope(MsgType::MembershipSnapshot, local_node_id_,
+                                                              local_ed25519_, payload);
 
                 auto serialized = crypto::serialize_envelope(env);
                 auto res = socket_->send_to(serialized, to_udp_endpoint(peer_ep));

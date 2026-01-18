@@ -9,9 +9,10 @@
 #include <botlink/core/result.hpp>
 #include <botlink/core/types.hpp>
 #include <datapod/datapod.hpp>
+#include <keylock/crypto/box_seal_x25519/x25519.hpp>
+#include <keylock/crypto/sign_ed25519/ed25519.hpp>
+#include <keylock/hash/sha256/sha256.hpp>
 #include <keylock/keylock.hpp>
-
-#include <sodium.h>
 
 namespace botlink {
 
@@ -41,11 +42,11 @@ namespace botlink {
             PublicKey public_key;
 
             // Generate seed
-            auto seed = keylock::utils::Common::generate_random_bytes(ED25519_SEED_SIZE);
+            auto seed = keylock::crypto::Common::generate_random_bytes(ED25519_SEED_SIZE);
 
             // Derive keypair from seed
             Array<u8, ED25519_SECRET_SIZE> secret_key{};
-            crypto_sign_seed_keypair(public_key.raw(), secret_key.data(), seed.data());
+            keylock::crypto::ed25519::seed_keypair(public_key.raw(), secret_key.data(), seed.data());
 
             // Store only the seed portion (first 32 bytes) for our PrivateKey
             for (usize i = 0; i < KEY_SIZE; ++i) {
@@ -53,8 +54,8 @@ namespace botlink {
             }
 
             // Secure clear
-            keylock::utils::Common::secure_clear(seed.data(), seed.size());
-            keylock::utils::Common::secure_clear(secret_key.data(), secret_key.size());
+            keylock::crypto::Common::secure_clear(seed.data(), seed.size());
+            keylock::crypto::Common::secure_clear(secret_key.data(), secret_key.size());
 
             return {private_key, public_key};
         }
@@ -64,9 +65,9 @@ namespace botlink {
             PublicKey public_key;
             Array<u8, ED25519_SECRET_SIZE> secret_key{};
 
-            crypto_sign_seed_keypair(public_key.raw(), secret_key.data(), private_key.raw());
+            keylock::crypto::ed25519::seed_keypair(public_key.raw(), secret_key.data(), private_key.raw());
 
-            keylock::utils::Common::secure_clear(secret_key.data(), secret_key.size());
+            keylock::crypto::Common::secure_clear(secret_key.data(), secret_key.size());
 
             return public_key;
         }
@@ -77,15 +78,15 @@ namespace botlink {
             PublicKey public_key;
 
             // Generate random private key
-            auto random = keylock::utils::Common::generate_random_bytes(X25519_SECRET_SIZE);
+            auto random = keylock::crypto::Common::generate_random_bytes(X25519_SECRET_SIZE);
             for (usize i = 0; i < KEY_SIZE; ++i) {
                 private_key.data[i] = random[i];
             }
 
             // Derive public key
-            crypto_scalarmult_base(public_key.raw(), private_key.raw());
+            keylock::crypto::x25519::public_key(public_key.raw(), private_key.raw());
 
-            keylock::utils::Common::secure_clear(random.data(), random.size());
+            keylock::crypto::Common::secure_clear(random.data(), random.size());
 
             return {private_key, public_key};
         }
@@ -93,7 +94,7 @@ namespace botlink {
         // Derive X25519 public key from private key
         inline auto x25519_public_from_private(const PrivateKey &private_key) -> PublicKey {
             PublicKey public_key;
-            crypto_scalarmult_base(public_key.raw(), private_key.raw());
+            keylock::crypto::x25519::public_key(public_key.raw(), private_key.raw());
             return public_key;
         }
 
@@ -106,7 +107,7 @@ namespace botlink {
             NodeId id;
 
             // Use SHA-256 hash of public key
-            crypto_hash_sha256(id.raw(), pubkey.raw(), KEY_SIZE);
+            keylock::hash::sha256::hash(id.raw(), pubkey.raw(), KEY_SIZE);
 
             return id;
         }
@@ -122,12 +123,12 @@ namespace botlink {
             // Reconstruct full secret key from seed
             Array<u8, ED25519_SECRET_SIZE> secret_key{};
             Array<u8, ED25519_PUBLIC_SIZE> public_key{};
-            crypto_sign_seed_keypair(public_key.data(), secret_key.data(), private_key.raw());
+            keylock::crypto::ed25519::seed_keypair(public_key.data(), secret_key.data(), private_key.raw());
 
             // Sign
             crypto_sign_detached(sig.raw(), nullptr, data, len, secret_key.data());
 
-            keylock::utils::Common::secure_clear(secret_key.data(), secret_key.size());
+            keylock::crypto::Common::secure_clear(secret_key.data(), secret_key.size());
 
             return sig;
         }
@@ -158,9 +159,7 @@ namespace botlink {
             -> Res<Array<u8, 32>> {
             Array<u8, 32> shared;
 
-            if (crypto_scalarmult(shared.data(), my_private.raw(), their_public.raw()) != 0) {
-                return result::err(err::crypto("X25519 key exchange failed"));
-            }
+            keylock::crypto::x25519::scalarmult(shared.data(), my_private.raw(), their_public.raw());
 
             return result::ok(shared);
         }

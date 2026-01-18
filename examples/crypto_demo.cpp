@@ -116,7 +116,7 @@ void demo_aead_encryption() {
 
     // Create a session key
     crypto::SessionKey key;
-    auto random = keylock::utils::Common::generate_random_bytes(32);
+    auto random = keylock::crypto::Common::generate_random_bytes(32);
     for (usize i = 0; i < 32; ++i) {
         key.data[i] = random[i];
     }
@@ -160,7 +160,7 @@ void demo_aead_encryption() {
     // Try decryption with wrong key
     std::cout << "\n--- Trying with wrong key ---\n";
     crypto::SessionKey wrong_key;
-    auto wrong_random = keylock::utils::Common::generate_random_bytes(32);
+    auto wrong_random = keylock::crypto::Common::generate_random_bytes(32);
     for (usize i = 0; i < 32; ++i) {
         wrong_key.data[i] = wrong_random[i];
     }

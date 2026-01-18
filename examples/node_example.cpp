@@ -47,8 +47,8 @@ auto main() -> int {
     // Create session keys
     std::cout << "Creating session with peer...\n";
     crypto::SessionKey send_key, recv_key;
-    auto rnd1 = keylock::utils::Common::generate_random_bytes(32);
-    auto rnd2 = keylock::utils::Common::generate_random_bytes(32);
+    auto rnd1 = keylock::crypto::Common::generate_random_bytes(32);
+    auto rnd2 = keylock::crypto::Common::generate_random_bytes(32);
     for (usize i = 0; i < 32; ++i) {
         send_key.data[i] = rnd1[i];
         recv_key.data[i] = rnd2[i];

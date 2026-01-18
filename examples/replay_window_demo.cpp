@@ -130,7 +130,7 @@ int main() {
 
     // Generate a session key
     crypto::SessionKey key;
-    auto random = keylock::utils::Common::generate_random_bytes(32);
+    auto random = keylock::crypto::Common::generate_random_bytes(32);
     for (usize i = 0; i < 32; ++i) {
         key.data[i] = random[i];
     }
